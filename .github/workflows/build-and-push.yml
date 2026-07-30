@@ -1,0 +1,57 @@
+name: Build and Push
+
+on:
+  push:
+    branches:
+      - stage
+  workflow_dispatch:
+
+# id-token: write is required to request the OIDC JWT used to authenticate to AWS
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-central-1
+  ECR_REPOSITORY: coturn
+
+jobs:
+  build-and-push:
+    name: Build and push image to Amazon ECR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          role-session-name: gha-${{ github.event.repository.name }}-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Read coturn version
+        id: version
+        run: echo "version=$(grep -m1 'COTURN_VER ?=' docker/coturn/Makefile | cut -d'=' -f2 | tr -d ' ')" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/coturn/alpine/Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.version }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
