@@ -18,7 +18,8 @@ env:
 jobs:
   build-and-push:
     name: Build and push image to Amazon ECR
-    runs-on: stage-eks
+    # GitHub-hosted: public fork - org self-hosted runner groups skip public repos.
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v5

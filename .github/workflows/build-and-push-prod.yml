@@ -18,7 +18,11 @@ env:
 jobs:
   build-and-push:
     name: Build and push image to Amazon ECR (prod)
-    runs-on: prod-eks
+    # GitHub-hosted: this fork is PUBLIC, so the org's self-hosted runner
+    # groups never pick its jobs up (and exposing self-hosted runners to a
+    # public repo is unsafe anyway). Hosted runners are free for public repos;
+    # ECR is reached via its public endpoint with the same OIDC role.
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v5
