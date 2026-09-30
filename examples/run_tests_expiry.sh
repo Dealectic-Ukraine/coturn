@@ -58,9 +58,9 @@ echo "Running turnserver (verbose, permission/channel lifetime ${PERM_LIFETIME}s
 # loopback.
 $BINDIR/turnserver --verbose --use-auth-secret --static-auth-secret=secret \
     --realm=north.gov --allow-loopback-peers \
-    --listening-ip=127.0.0.1 --relay-ip=127.0.0.1 --no-dtls --no-tls \
+    --listening-ip=127.0.0.1 --relay-ip=127.0.0.1 --no-tls \
     --permission-lifetime=$PERM_LIFETIME --channel-lifetime=$CHAN_LIFETIME \
-    --log-file=stdout --simple-log \
+    --log-file=stdout \
     --cert ../examples/ca/turn_server_cert.pem --pkey ../examples/ca/turn_server_pkey.pem \
     > "$TURNSERVER_LOG" 2>&1 &
 turnserver_pid="$!"

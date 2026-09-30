@@ -209,6 +209,133 @@ bool stun_calculate_hmac(const uint8_t *buf, size_t len, const uint8_t *key, siz
   return true;
 }
 
+/* MAC half of the stateless nonce: 16 lowercase hex chars = first 8 bytes of
+ * HMAC-SHA256(key, "<client-addr>|<timestamp-hex>"). `ts_hex` is the 8-char
+ * timestamp exactly as it appears in the nonce, so the MAC covers the same
+ * bytes the validator parses. */
+static bool stateless_nonce_mac(const uint8_t *key, size_t key_size, const ioa_addr *addr,
+                                const char ts_hex[TURN_STATELESS_NONCE_TIMESTAMP_LENGTH + 1],
+                                char mac_hex[TURN_STATELESS_NONCE_MAC_LENGTH + 1]) {
+  uint8_t hmac[MAXSHASIZE] = {0};
+  unsigned int hmac_len = sizeof(hmac);
+
+  char msg[MAX_IOA_ADDR_STRING + TURN_STATELESS_NONCE_TIMESTAMP_LENGTH + 2] = {0};
+  addr_to_string(addr, msg);
+  const size_t alen = strlen(msg);
+  snprintf(msg + alen, sizeof(msg) - alen, "|%s", ts_hex);
+
+  if (!stun_calculate_hmac((const uint8_t *)msg, strlen(msg), key, key_size, hmac, &hmac_len, SHATYPE_SHA256) ||
+      (hmac_len < TURN_STATELESS_NONCE_MAC_LENGTH / 2)) {
+    return false;
+  }
+
+  static const char hex[] = "0123456789abcdef";
+  for (size_t i = 0; i < TURN_STATELESS_NONCE_MAC_LENGTH; ++i) {
+    const uint8_t b = hmac[i / 2];
+    mac_hex[i] = hex[(i % 2) ? (b & 0x0f) : (b >> 4)];
+  }
+  mac_hex[TURN_STATELESS_NONCE_MAC_LENGTH] = 0;
+
+  return true;
+}
+
+bool turn_derive_stateless_nonce_key(const uint8_t *secret, size_t secret_len, uint8_t *key, size_t key_size) {
+  if (!secret || !secret_len || !key || (key_size != TURN_STATELESS_NONCE_KEY_SIZE)) {
+    return false;
+  }
+
+  static const char label[] = "coturn-stateless-nonce-v1";
+
+  ERR_clear_error();
+  EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+  if (!ctx) {
+    return false;
+  }
+  unsigned int key_len = 0;
+  const bool ok = (EVP_DigestInit(ctx, EVP_sha256()) == 1) && (EVP_DigestUpdate(ctx, label, sizeof(label)) == 1) &&
+                  (EVP_DigestUpdate(ctx, secret, secret_len) == 1) && (EVP_DigestFinal(ctx, key, &key_len) == 1) &&
+                  (key_len == TURN_STATELESS_NONCE_KEY_SIZE);
+  EVP_MD_CTX_free(ctx);
+
+  return ok;
+}
+
+bool turn_generate_stateless_nonce(const uint8_t *key, size_t key_size, const ioa_addr *addr, uint32_t timestamp,
+                                   char *nonce, size_t nonce_size) {
+  if (!key || !key_size || !addr || !nonce || (nonce_size < TURN_STATELESS_NONCE_SIZE)) {
+    return false;
+  }
+
+  char ts_hex[TURN_STATELESS_NONCE_TIMESTAMP_LENGTH + 1] = {0};
+  snprintf(ts_hex, sizeof(ts_hex), "%08lx", (unsigned long)timestamp);
+
+  char mac_hex[TURN_STATELESS_NONCE_MAC_LENGTH + 1] = {0};
+  if (!stateless_nonce_mac(key, key_size, addr, ts_hex, mac_hex)) {
+    return false;
+  }
+
+  snprintf(nonce, nonce_size, "%s%s", ts_hex, mac_hex);
+  return true;
+}
+
+bool turn_check_stateless_nonce(const uint8_t *key, size_t key_size, const ioa_addr *addr, uint32_t now,
+                                uint32_t max_age, const char *nonce, uint32_t *timestamp_out) {
+  if (!key || !key_size || !addr || !nonce) {
+    return false;
+  }
+
+  /* Strict format: exactly 24 lowercase hex chars. */
+  if (strlen(nonce) != TURN_STATELESS_NONCE_LENGTH) {
+    return false;
+  }
+  uint32_t ts = 0;
+  for (size_t i = 0; i < TURN_STATELESS_NONCE_LENGTH; ++i) {
+    const char c = nonce[i];
+    int v;
+    if ((c >= '0') && (c <= '9')) {
+      v = c - '0';
+    } else if ((c >= 'a') && (c <= 'f')) {
+      v = 10 + (c - 'a');
+    } else {
+      return false;
+    }
+    if (i < TURN_STATELESS_NONCE_TIMESTAMP_LENGTH) {
+      ts = (ts << 4) | (uint32_t)v;
+    }
+  }
+
+  char ts_hex[TURN_STATELESS_NONCE_TIMESTAMP_LENGTH + 1] = {0};
+  memcpy(ts_hex, nonce, TURN_STATELESS_NONCE_TIMESTAMP_LENGTH);
+
+  char mac_hex[TURN_STATELESS_NONCE_MAC_LENGTH + 1] = {0};
+  if (!stateless_nonce_mac(key, key_size, addr, ts_hex, mac_hex)) {
+    return false;
+  }
+
+  /* Constant-time comparison: no early exit a forger could time. */
+  uint8_t diff = 0;
+  for (size_t i = 0; i < TURN_STATELESS_NONCE_MAC_LENGTH; ++i) {
+    diff |= (uint8_t)(mac_hex[i] ^ nonce[TURN_STATELESS_NONCE_TIMESTAMP_LENGTH + i]);
+  }
+  if (diff) {
+    return false;
+  }
+
+  /* Freshness. */
+  if (ts > now) {
+    if ((ts - now) > TURN_STATELESS_NONCE_MAX_CLOCK_SKEW) {
+      return false;
+    }
+  } else if ((now - ts) > max_age) {
+    return false;
+  }
+
+  if (timestamp_out) {
+    *timestamp_out = ts;
+  }
+  return true;
+}
+
 bool stun_produce_integrity_key_str(const uint8_t *uname, const uint8_t *realm, const uint8_t *upwd, hmackey_t key,
                                     SHATYPE shatype) {
   bool ret;
@@ -483,15 +610,15 @@ bool old_stun_is_command_message_str(const uint8_t *buf, size_t blen, uint32_t *
   return false;
 }
 
-bool stun_is_command_message_full_check_str(const uint8_t *buf, size_t blen, int must_check_fingerprint,
-                                            int *fingerprint_present) {
+bool stun_is_command_message_full_check_str(const uint8_t *buf, size_t blen, bool must_check_fingerprint,
+                                            bool *fingerprint_present) {
   if (!stun_is_command_message_str(buf, blen)) {
     return false;
   }
   stun_attr_ref sar = stun_attr_get_first_by_type_str(buf, blen, STUN_ATTRIBUTE_FINGERPRINT);
   if (!sar) {
     if (fingerprint_present) {
-      *fingerprint_present = 0;
+      *fingerprint_present = false;
     }
     if (stun_get_method_str(buf, blen) == STUN_METHOD_BINDING) {
       return true;
@@ -570,7 +697,11 @@ bool stun_is_challenge_response_str(const uint8_t *buf, size_t len, int *err_cod
       const uint8_t *value = stun_attr_get_value(sar);
       if (value) {
         size_t vlen = (size_t)stun_attr_get_len(sar);
-        vlen = min(vlen, (size_t)STUN_MAX_REALM_SIZE);
+        /* Truncating would corrupt the realm mid-codepoint and fail the integrity
+         * check later with an unrelated error; reject the challenge instead. */
+        if (vlen > (size_t)STUN_MAX_REALM_SIZE) {
+          return false;
+        }
         memcpy(realm, value, vlen);
         realm[vlen] = 0;
         {
@@ -596,7 +727,9 @@ bool stun_is_challenge_response_str(const uint8_t *buf, size_t len, int *err_cod
           value = stun_attr_get_value(sar);
           if (value) {
             vlen = (size_t)stun_attr_get_len(sar);
-            vlen = min(vlen, (size_t)STUN_MAX_NONCE_SIZE);
+            if (vlen > (size_t)STUN_MAX_NONCE_SIZE) {
+              return false;
+            }
             memcpy(nonce, value, vlen);
             nonce[vlen] = 0;
             if (oauth) {
@@ -752,7 +885,7 @@ const uint8_t *get_default_reason(int error_code) {
 }
 
 static void stun_init_error_response_common_str(uint8_t *buf, size_t *len, uint16_t error_code, const uint8_t *reason,
-                                                stun_tid *id, bool include_reason_string) {
+                                                stun_tid *id, bool include_reason_string, bool pad_reason_phrase) {
 
   if (include_reason_string && (!reason || !strcmp((const char *)reason, "Unknown error"))) {
     reason = get_default_reason(error_code);
@@ -770,8 +903,9 @@ static void stun_init_error_response_common_str(uint8_t *buf, size_t *len, uint1
   avalue[sizeof(avalue) - 1] = 0;
   int alen = 4 + (int)strlen((const char *)(avalue + 4));
 
-  //"Manual" padding for compatibility with classic old stun:
-  {
+  /* RFC 3489 Section 11.2.9 requires a reason phrase length that is a multiple of 4;
+   * RFC 8489 Section 14 requires the declared length to exclude padding. */
+  if (pad_reason_phrase) {
     const int rem = alen % 4;
     if (rem) {
       alen += (4 - rem);
@@ -790,7 +924,7 @@ void old_stun_init_error_response_str(uint16_t method, uint8_t *buf, size_t *len
 
   old_stun_init_command_str(stun_make_error_response(method), buf, len, cookie);
 
-  stun_init_error_response_common_str(buf, len, error_code, reason, id, include_reason_string);
+  stun_init_error_response_common_str(buf, len, error_code, reason, id, include_reason_string, true);
 }
 
 void stun_init_error_response_str(uint16_t method, uint8_t *buf, size_t *len, uint16_t error_code,
@@ -798,7 +932,7 @@ void stun_init_error_response_str(uint16_t method, uint8_t *buf, size_t *len, ui
 
   stun_init_command_str(stun_make_error_response(method), buf, len);
 
-  stun_init_error_response_common_str(buf, len, error_code, reason, id, include_reason_string);
+  stun_init_error_response_common_str(buf, len, error_code, reason, id, include_reason_string, false);
 }
 
 /////////// CHANNEL ////////////////////////////////////////////////
@@ -1166,8 +1300,8 @@ bool stun_set_allocate_response_str(uint8_t *buf, size_t *len, stun_tid *tid, co
 uint16_t stun_set_channel_bind_request_str(uint8_t *buf, size_t *len, const ioa_addr *peer_addr,
                                            uint16_t channel_number) {
 
-  if (!STUN_VALID_CHANNEL(channel_number)) {
-    channel_number = 0x4000 + ((uint16_t)(((uint32_t)turn_random_number()) % (0x7FFF - 0x4000 + 1)));
+  if (!STUN_VALID_CHANNEL_BIND(channel_number)) {
+    channel_number = 0x4000 + ((uint16_t)(((uint32_t)turn_random_number()) % (0x4FFF - 0x4000 + 1)));
   }
 
   stun_init_request_str(STUN_METHOD_CHANNEL_BIND, buf, len);
@@ -1221,8 +1355,12 @@ bool stun_set_binding_response_str(uint8_t *buf, size_t *len, stun_tid *tid, con
         return false;
       }
     }
+    /* MAPPED-ADDRESS is the only address attribute RFC 3489 defines, so the old-STUN
+     * path always needs it. On the modern path it is purely a backward-compatibility
+     * courtesy for clients that cannot parse XOR-MAPPED-ADDRESS, and it widens the
+     * response, so it stays opt-in there. */
     if (reflexive_addr) {
-      if (stun_backward_compatibility &&
+      if ((old_stun || stun_backward_compatibility) &&
           !stun_attr_add_addr_str(buf, len, STUN_ATTRIBUTE_MAPPED_ADDRESS, reflexive_addr)) {
         return false;
       }
@@ -1475,6 +1613,18 @@ stun_attr_ref stun_attr_get_first_by_type_str(const uint8_t *buf, size_t len, ui
   return NULL;
 }
 
+stun_attr_ref stun_attr_get_first_covered_by_type_str(const uint8_t *buf, size_t len, uint16_t attr_type) {
+  stun_attr_ref attr = stun_attr_get_first_str(buf, len);
+  while (attr) {
+    if (stun_attr_get_type(attr) == attr_type) {
+      return attr;
+    }
+    attr = stun_attr_get_next_covered_str(buf, len, attr);
+  }
+
+  return NULL;
+}
+
 static stun_attr_ref stun_attr_check_valid(stun_attr_ref attr, size_t remaining) {
   if (remaining >= 4) {
     /* Read the size of the attribute */
@@ -1676,22 +1826,16 @@ bool stun_attr_add_bandwidth_str(uint8_t *buf, size_t *len, band_limit_t bps0) {
 bool stun_attr_add_address_error_code(uint8_t *buf, size_t *len, int requested_address_family, int error_code) {
   const uint8_t *reason = get_default_reason(error_code);
 
-  uint8_t avalue[513];
+  uint8_t avalue[513] = {0};
   avalue[0] = (uint8_t)requested_address_family;
   avalue[1] = 0;
   avalue[2] = (uint8_t)(error_code / 100);
   avalue[3] = (uint8_t)(error_code % 100);
   strncpy((char *)(avalue + 4), (const char *)reason, sizeof(avalue) - 4);
   avalue[sizeof(avalue) - 1] = 0;
-  int alen = 4 + (int)strlen((const char *)(avalue + 4));
 
-  //"Manual" padding for compatibility with classic old stun:
-  {
-    const int rem = alen % 4;
-    if (rem) {
-      alen += (4 - rem);
-    }
-  }
+  /* RFC 8489 Section 14: the declared length excludes padding. */
+  const int alen = 4 + (int)strlen((const char *)(avalue + 4));
 
   return stun_attr_add_str(buf, len, STUN_ATTRIBUTE_ADDRESS_ERROR_CODE, (uint8_t *)avalue, alen);
 }
@@ -1797,7 +1941,9 @@ bool SASLprep(uint8_t *s) {
       case 0x7F:
         return false;
       default:
-        if (c < 0x1F) {
+        /* RFC 4013 Section 2.3 / RFC 3454 Table C.2.1: the prohibited ASCII
+         * control range is U+0000-U+001F, so 0x1F must be rejected too. */
+        if (c <= 0x1F) {
           return false;
         }
         if (c >= 0x80 && c <= 0x9F) {
@@ -2073,10 +2219,15 @@ int stun_attr_get_padding_len_str(stun_attr_ref attr) {
 }
 
 bool stun_attr_add_padding_str(uint8_t *buf, size_t *len, uint16_t padding_len) {
-  uint8_t avalue[0xFFFF];
-  memset(avalue, 0, padding_len);
+  /* PADDING is all zeroes, so the scratch value is heap-allocated rather than a
+   * 64 KB stack array: this runs on relay threads for RFC 5780 responses. */
+  uint8_t *avalue = (uint8_t *)turn_calloc(1, padding_len);
 
-  return stun_attr_add_str(buf, len, STUN_ATTRIBUTE_PADDING, avalue, padding_len);
+  const bool ret = stun_attr_add_str(buf, len, STUN_ATTRIBUTE_PADDING, avalue, padding_len);
+
+  free(avalue);
+
+  return ret;
 }
 
 /* OAUTH */

@@ -40,6 +40,17 @@ if [ ! -f $BINDIR/turnserver ]; then
     BINDIR="../build/bin"
 fi
 
+# Bound the client where a timeout tool exists. A stock macOS runner has
+# neither `timeout` nor `gtimeout` and never hits the Linux/TSan loadgen
+# livelock this guards; its job timeout-minutes is the backstop.
+if command -v timeout >/dev/null 2>&1; then
+    RUN_BOUNDED="timeout 120s"
+elif command -v gtimeout >/dev/null 2>&1; then
+    RUN_BOUNDED="gtimeout 120s"
+else
+    RUN_BOUNDED=""
+fi
+
 IS_DARWIN=0
 if [ "$(uname -s)" = "Darwin" ]; then
     IS_DARWIN=1
@@ -56,7 +67,7 @@ fi
 echo 'Running turnserver (--mobility)'
 # Always capture the server log (both platforms): the handoff assertion below
 # greps it for the RFC 8016 dual-5-tuple transition marker.
-$BINDIR/turnserver --use-auth-secret --sock-buf-size=1048576 --static-auth-secret=secret --realm=north.gov --allow-loopback-peers --mobility --log-file=stdout --simple-log $TURNSERVER_EXTRA_ARGS --cert ../examples/ca/turn_server_cert.pem --pkey ../examples/ca/turn_server_pkey.pem > "$TURNSERVER_LOG" 2>&1 &
+$BINDIR/turnserver --use-auth-secret --sock-buf-size=1048576 --static-auth-secret=secret --realm=north.gov --allow-loopback-peers --mobility --log-file=stdout $TURNSERVER_EXTRA_ARGS --cert ../examples/ca/turn_server_cert.pem --pkey ../examples/ca/turn_server_pkey.pem > "$TURNSERVER_LOG" 2>&1 &
 turnserver_pid="$!"
 
 echo 'Running peer client'
@@ -91,12 +102,11 @@ wait_for_turnserver() {
     tail -30 "$TURNSERVER_LOG" 2>/dev/null || echo "(log file missing)"
     return 1
 }
-if [ $IS_DARWIN -eq 1 ]; then
-    sleep 2
-else
-    wait_for_turnserver || exit 1
-    sleep 2
-fi
+# Poll on both platforms: the log is captured on macOS too, and a fixed
+# sleep races uclient against a still-initializing server on hosts with
+# many local addresses (relay init runs per address).
+wait_for_turnserver || exit 1
+sleep 2
 
 diagnose_failure() {
     local label="$1"
@@ -119,8 +129,14 @@ run_uclient() {
     local label="$1"
     shift
     echo "Running $label"
-    "$BINDIR/turnutils_uclient" -M "$@" -e 127.0.0.1 -X -g -u user -W secret 127.0.0.1 > "$UCLIENT_LOG" 2>&1
-    if grep -q "start_mclient: tot_send_bytes ~ 1000, tot_recv_bytes ~ 1000" "$UCLIENT_LOG"; then
+    # Bound the run so a ThreadSanitizer-exposed loadgen livelock can't hang CI;
+    # success is decided by the grep below, so a post-completion timeout kill
+    # still passes, while a genuine failure still shows no marker.
+    $RUN_BOUNDED "$BINDIR/turnutils_uclient" -M "$@" -e 127.0.0.1 -X -g -u user -W secret 127.0.0.1 > "$UCLIENT_LOG" 2>&1
+    # Match the periodic progress line too, not only the final-summary line: a
+    # client the timeout had to kill never prints the summary, but a periodic
+    # line already carries the full byte counts once the round trip has completed.
+    if grep -q "tot_send_bytes ~ 1000, tot_recv_bytes ~ 1000" "$UCLIENT_LOG"; then
         echo OK
     else
         echo FAIL

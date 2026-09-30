@@ -400,8 +400,10 @@ static char *get_real_username(char *usname) {
  * Password retrieval
  */
 int get_user_key(int in_oauth, int *out_oauth, int *max_session_time, uint8_t *usname, uint8_t *realm, hmackey_t key,
-                 ioa_network_buffer_handle nbh) {
+                 ioa_network_buffer_handle nbh, turn_key_lookup_result *key_lookup) {
   int ret = -1;
+
+  *key_lookup = TURN_KEY_LOOKUP_NOT_FOUND;
 
   if (max_session_time) {
     *max_session_time = 0;
@@ -409,8 +411,8 @@ int get_user_key(int in_oauth, int *out_oauth, int *max_session_time, uint8_t *u
 
   if (in_oauth && out_oauth && usname && usname[0]) {
 
-    stun_attr_ref sar = stun_attr_get_first_by_type_str(ioa_network_buffer_data(nbh), ioa_network_buffer_get_size(nbh),
-                                                        STUN_ATTRIBUTE_OAUTH_ACCESS_TOKEN);
+    stun_attr_ref sar = stun_attr_get_first_covered_by_type_str(
+        ioa_network_buffer_data(nbh), ioa_network_buffer_get_size(nbh), STUN_ATTRIBUTE_OAUTH_ACCESS_TOKEN);
     if (sar) {
 
       const int len = stun_attr_get_len(sar);
@@ -542,14 +544,27 @@ int get_user_key(int in_oauth, int *out_oauth, int *max_session_time, uint8_t *u
 
     init_secrets_list(&sl);
 
+    /* get_auth_secrets() populates the list before it can fail, so every exit
+       from here on has to release it. */
     if (get_auth_secrets(&sl, realm) < 0) {
+      clean_secrets_list(&sl);
       return ret;
     }
 
     ts = get_rest_api_timestamp((char *)usname);
 
-    if (!turn_time_before(ts, ctime)) {
+    /* Expired timestamps are rejected before any per-secret HMAC work (integrity is never
+       checked), so a replay flood cannot induce integrity computation. */
+    if (turn_time_before(ts, ctime)) {
+      /* ts == 0 means the username carried no parseable timestamp, not an expired one. */
+      if (ts) {
+        *key_lookup = TURN_KEY_LOOKUP_EXPIRED;
+      }
+      clean_secrets_list(&sl);
+      return ret;
+    }
 
+    {
       uint8_t hmac[MAXSHASIZE];
       unsigned int hmac_len;
       password_t pwdtmp;
@@ -559,6 +574,7 @@ int get_user_key(int in_oauth, int *out_oauth, int *max_session_time, uint8_t *u
       stun_attr_ref sar = stun_attr_get_first_by_type_str(
           ioa_network_buffer_data(nbh), ioa_network_buffer_get_size(nbh), STUN_ATTRIBUTE_MESSAGE_INTEGRITY);
       if (!sar) {
+        clean_secrets_list(&sl);
         return -1;
       }
 
@@ -571,6 +587,7 @@ int get_user_key(int in_oauth, int *out_oauth, int *max_session_time, uint8_t *u
       case SHA384SIZEBYTES:
       case SHA512SIZEBYTES:
       default:
+        clean_secrets_list(&sl);
         return -1;
       };
 
@@ -605,6 +622,10 @@ int get_user_key(int in_oauth, int *out_oauth, int *max_session_time, uint8_t *u
             }
           }
         }
+      }
+
+      if (ret < 0) {
+        *key_lookup = TURN_KEY_LOOKUP_INTEGRITY_MISMATCH;
       }
     }
 
@@ -765,8 +786,13 @@ int add_static_user_account(char *user) {
     char *keysource = s + 2;
     const size_t sz = get_hmackey_size(SHATYPE_DEFAULT);
     if (strlen(keysource) < sz * 2) {
-      /* Do not log the key material itself; identify by username. */
+      /* A short key would make convert_string_key_to_binary read past its end;
+         reject the account instead of decoding it, as every DB driver does. Do
+         not log the key material itself; identify by username. */
       TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Wrong key format for user: %s\n", usname);
+      free(usname);
+      free(key);
+      return -1;
     }
     convert_string_key_to_binary(keysource, *key, sz);
   } else {

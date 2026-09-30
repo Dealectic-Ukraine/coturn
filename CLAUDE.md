@@ -21,7 +21,10 @@ cmake --build build -j$(nproc)
 
 Key CMake options:
 - `-DFUZZER=ON` — build OSS-Fuzz targets (requires Clang or AppleClang)
-- `-DCMAKE_BUILD_TYPE=Debug|Release`
+- `-DCMAKE_BUILD_TYPE=Debug|Release` — defaults to `Release` (`-O3 -DNDEBUG`) when
+  unset, so benchmark and load-test builds are optimized without opting in.
+  `-DFUZZER=ON` builds are exempt: they take their `-O`/`-fsanitize` flags from
+  the OSS-Fuzz `CFLAGS` environment.
 - `-DWITH_MYSQL=ON/OFF`, `-DWITH_PGSQL=ON/OFF`, `-DWITH_MONGO=ON/OFF`, `-DWITH_REDIS=ON/OFF`
 
 ## Required validation
@@ -92,6 +95,21 @@ cd examples
                                 # path. Needs a second bindable loopback IP
                                 # (native on Linux; SKIPs on macOS without a
                                 # 127.0.0.2 alias).
+./run_tests_stateless_nonce.sh  # starts the server with --stateless-nonce
+                                # (derived challenge nonces, issue #1999) and
+                                # runs the standard relay workload over
+                                # UDP/TCP (+TLS/DTLS on Linux), asserting
+                                # wire-transparency plus the listener
+                                # fast-path marker in the server log.
+./run_tests_ipv6_relay.sh       # pins that an IPv6 allocation is advertised
+                                # under its real IPv6 relayed transport address
+                                # (not an IPv4 --external-ip) and that uclient
+                                # accepts an IPv6 relay it did not explicitly
+                                # request (-A keep). SKIPs without a usable
+                                # IPv6 loopback.
+./run_tests_dtls_default.sh     # pins that the DTLS listeners stay down
+                                # unless --dtls is given, that --dtls brings
+                                # them up
 ./run_tests_prom.sh             # only when Prometheus support is built
 cd ..
 
@@ -113,8 +131,9 @@ docker run --rm \
   -v "$PWD:/src:ro" \
   --entrypoint bash \
   coturn-fuzz-local \
-  -lc 'apt-get update && apt-get install -y --no-install-recommends git && \
+  -lc 'apt-get update && apt-get install -y --no-install-recommends git libmicrohttpd-dev && \
        cp -a /src /tmp/coturn && \
+       git config --global --add safe.directory /tmp/coturn && \
        cd /tmp/coturn && \
        rm -rf Makefile bin lib include sqlite build build-win && \
        cmake -S . -B build-linux -DBUILD_TESTING=ON && \
@@ -123,7 +142,8 @@ docker run --rm \
        rm -rf build && ln -s build-linux build && \
        cd examples && ./run_tests.sh && ./run_tests_conf.sh && \
        ./run_tests_mobile.sh && ./run_tests_multiplex_peer.sh && \
-       ./run_tests_rfc5780.sh'
+       ./run_tests_rfc5780.sh && ./run_tests_stateless_nonce.sh && \
+       ./run_tests_ipv6_relay.sh && ./run_tests_dtls_default.sh'
 ```
 
 Also validate the packaged Docker image. Run the same stale-output cleanup at
@@ -179,6 +199,21 @@ Key style rules (LLVM-based):
 - Zero-initialize stack buffers at declaration: `uint8_t buf[N] = {0}` or `SomeStruct s = {0}`
 - Prefix new identifiers (functions, types, macros) with `turn_`, not `ns_` — the `ns_` names are
   legacy; do not add new ones
+
+### Comments
+
+Keep comments short — one line, two at most. A comment explains **why** the code is there,
+not what it does; if the code already reads clearly, omit it. Cite the normative source when
+that is the reason for the code:
+
+```c
+/* RFC 8656 Section 12: channel numbers are restricted to 0x4000-0x4FFF. */
+```
+
+A comment must stand on its own, read cold, with no knowledge of the change that introduced
+it. Do not write: that a change is part of a larger or multi-part effort, references to a
+prior discussion or review, what the code used to do, an issue/PR number as the only
+justification, or attribution.
 
 ## Memory allocation
 
@@ -286,7 +321,7 @@ environment variable such as `DIGITALOCEAN_TOKEN`.
   randomly between 0 and -1 ([startuclient.c:440](src/apps/uclient/startuclient.c:440)).
 - `--no-even-port` — force `ep = -1` unconditionally. **Required** for
   alloc-flood runs against `--multiplex-peer`, which strictly rejects
-  EVEN-PORT with error 400 ([ns_ioalib_engine_impl.c:1585](src/apps/relay/ns_ioalib_engine_impl.c:1585)).
+  EVEN-PORT with error 508 ([ns_ioalib_engine_impl.c:1603](src/apps/relay/ns_ioalib_engine_impl.c:1603)).
 - `-K N` / `--listener-threads N`, `--sender-threads N` — loadgen-side
   receive/send pools. Auto: 0 for `-m < 4`, bumped to 1 listener / 2
   sender for `-m >= 4`. Max 4 each. Use `--sender-threads 4` to push
@@ -358,8 +393,8 @@ nohup /root/coturn/build/bin/turnserver \
   --allow-loopback-peers \
   --listening-ip=10.116.0.2 --relay-ip=10.116.0.2 \
   --min-port=49152 --max-port=65535 \
-  --no-cli --no-tls --no-dtls \
-  --log-file=stdout --simple-log \
+  --no-tls \
+  --log-file=stdout \
   $EXTRA \
   > /root/runs/${LABEL}.turnserver.log 2>&1 &
 echo $! > /root/runs/${LABEL}.pid
@@ -473,7 +508,7 @@ For any run, look at the three `mpstat Average:` lines:
 
 ```bash
 # on uclient — alloc-flood; --no-even-port keeps multiplex-peer from
-# rejecting every other request with 400.
+# rejecting every other request with 508.
 timeout -s INT 60s /root/coturn/build/bin/turnutils_uclient \
   -Y alloc -m 200 -n 1000 -c --no-even-port \
   -L 10.116.0.3 \

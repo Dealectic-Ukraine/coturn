@@ -1,15 +1,21 @@
 Currently implemented functionality:
 
-1) RFC5389 (new STUN protocol) full server and client 
-implementations. We do not maintain strict compatibility 
-with the obsolete RFC 3489 "old STUN" protocol.
+1) RFC5389 (new STUN protocol) full server and client
+implementations. RFC 8489 obsoletes RFC 5389: its message-processing
+rules are implemented, but its authentication additions
+(MESSAGE-INTEGRITY-SHA256, PASSWORD-ALGORITHMS, USERHASH, the nonce
+cookie) are not, so RFC 8489 clients use that spec's backward-compatible
+MD5/SHA-1 path. We do not maintain strict compatibility with the
+obsolete RFC 3489 "old STUN" protocol.
 
-2) RFC5766 TURN protocol full server and client 
-implementations. We support file-based long term 
-user credentials, for now. We added experimental DTLS 
-protocol, too. 
+2) RFC5766 TURN protocol full server and client
+implementations, updated to RFC 8656, which obsoletes RFC 5766. ICMP
+relaying (RFC 8656 Section 11.5) is not implemented. We support
+file-based long term user credentials, for now. We added experimental
+DTLS protocol, too.
 
-3) RFC6156 TURN IPv6 extension.
+3) RFC6156 TURN IPv6 extension, folded into RFC 8656 and implemented
+including dual allocation.
 
 4) We support the following client-to-server 
 network transports for TURN messages:
@@ -53,7 +59,9 @@ for Linux. Other platforms support the alternative behavior of RFC 5766.
 
 21) Redis database support added.
 
-22) RFC3489 backward compatibility.
+22) RFC3489 backward compatibility (DEPRECATED, opt-in via
+--rfc3489-compatibility; scheduled for removal in the next major
+release - see docs/rfc3489-deprecation.md).
 
 23) Multithreaded TCP relay processing (UDP relay has been 
 multithreaded from the beginning).

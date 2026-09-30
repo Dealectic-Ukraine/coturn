@@ -116,12 +116,8 @@ turn_params_t turn_params = {
 #else
     false,
 #endif
-/*no_dtls*/
-#if !DTLS_SUPPORTED
-    true,
-#else
+    /* dtls: the DTLS listeners are opt-in, enabled with --dtls. */
     false,
-#endif
 
     NULL,      /*tls_ctx_update_ev*/
     {0, NULL}, /*tls_mutex*/
@@ -246,8 +242,9 @@ turn_params_t turn_params = {
 
     false, /* log_binding */
     false, /* stun_backward_compatibility */
+    false, /* rfc5766_channel_numbers */
+    false, /* rfc3489_compatibility */
     false, /* respond_http_unsupported */
-    true,  /* drop_invalid_packets */
     false, /* drop_invalid_packets_log */
 #if defined(__linux__)
     true,  /* udp_recvmmsg (on by default; disable with --udp-recvmmsg=false) */
@@ -259,10 +256,16 @@ turn_params_t turn_params = {
     false, /* include_reason_string */
     false, /* multiplex_peer */
     0,     /* multiplex_peer_base_port */
+    0,     /* multiplex_peer_max_peers */
 
     ///////// Ratelimit /////////
-    false,                                 /* unauthorized-ratelimit */
-    RATELIMIT_DEFAULT_MAX_REQUESTS_PER_SEC /* unauthorized-ratelimit-rps */
+    false,                                  /* unauthorized-ratelimit */
+    RATELIMIT_DEFAULT_MAX_REQUESTS_PER_SEC, /* unauthorized-ratelimit-rps */
+
+    ///////// Stateless nonce /////////
+    true, /* stateless-nonce */
+    {0},  /* stateless_nonce_key (generated at startup when enabled) */
+    false /* stateless_nonce_key_set */
 };
 
 //////////////// OpenSSL Init //////////////////////
@@ -1026,8 +1029,10 @@ static char Usage[] =
     "behind NAT.\n"
     "						In that situation, if a -X is used in form \"-X ip\" then that ip will "
     "be reported\n"
-    "						as relay IP address of all allocations. This scenario works only in a "
-    "simple case\n"
+    "						as relay IP address of all allocations of its own address family (a "
+    "relay of the\n"
+    "						other family is reported under its own address). This scenario works "
+    "only in a simple case\n"
     "						when one single relay address is be used, and no STUN CHANGE_REQUEST\n"
     "						functionality is required.\n"
     "						That single relay address must be mapped by NAT to the 'external' IP.\n"
@@ -1211,11 +1216,14 @@ static char Usage[] =
     "command line only.\n"
     " --cert			<filename>		Certificate file, PEM format. Same file search rules\n"
     "						applied as for the configuration file.\n"
-    "						If both --no-tls and --no_dtls options\n"
-    "						are specified, then this parameter is not needed.\n"
+    "						If --no-tls is specified and --dtls is not,\n"
+    "						then this parameter is not needed.\n"
+    " --raw-public-keys[=<value>]			Enable raw public keys support (RFC 7250). Off by default;\n"
+    "						requires OpenSSL 3.2.1 or later.\n"
     " --pkey			<filename>		Private key file, PEM format. Same file search rules\n"
     "						applied as for the configuration file.\n"
-    "						If both --no-tls and --no-dtls options\n"
+    "						If --no-tls is specified and --dtls is not,\n"
+    "						then this parameter is not needed.\n"
     " --pkey-pwd		<password>		If the private key file is encrypted, then this password to be "
     "used.\n"
     " --cipher-list		<cipher-string>		Allowed OpenSSL cipher list for TLS/DTLS connections.\n"
@@ -1246,7 +1254,7 @@ static char Usage[] =
     " --no-udp					Do not start UDP client listeners.\n"
     " --no-tcp					Do not start TCP client listeners.\n"
     " --no-tls					Do not start TLS client listeners.\n"
-    " --no-dtls					Do not start DTLS client listeners.\n"
+    " --dtls					Start DTLS client listeners. DTLS is not started by default.\n"
     " --no-udp-relay					Do not allow UDP relay endpoints, use only TCP relay option.\n"
     " --no-tcp-relay					Do not allow TCP relay endpoints, use only UDP relay options.\n"
     " -l, --log-file		<filename>		Option to set the full path name of the log file.\n"
@@ -1272,9 +1280,17 @@ static char Usage[] =
     "						name will be constructed as-is, without PID and date appendage.\n"
     "						This option can be used, for example, together with the logrotate "
     "tool.\n"
-    " --new-log-timestamp				Enable full ISO-8601 timestamp in all logs.\n"
+    " --log-min-level	<level>			Only emit log messages at or above this level: debug, info, "
+    "warning,\n"
+    "						or error. Default is debug (everything). An unrecognized level is\n"
+    "						ignored with a warning.\n"
+    " --new-log-timestamp[=<value>]		Use a full ISO-8601 timestamp in all logs. Enabled by default;\n"
+    "						pass --new-log-timestamp=false for the legacy counter of\n"
+    "						seconds since start.\n"
     " --new-log-timestamp-format    	<format>	Set timestamp format (in strftime(1) format). Depends on "
     "--new-log-timestamp to be enabled.\n"
+    "						Besides the strftime(1) conversions, %f expands to "
+    "milliseconds.\n"
     " --log-binding					Log STUN binding request. It is now disabled by default to "
     "avoid DoS attacks.\n"
     " --stale-nonce[=<value>]			Use extra security with nonce value having limited lifetime (default "
@@ -1395,13 +1411,28 @@ static char Usage[] =
     "amplification attack.)\n"
     "						Strongly encouraged to keep it off to decrease gain factor in STUN "
     "binding responses.\n"
-    " --stun-backward-compatibility		        Enable handling old STUN Binding requests and enable "
-    "MAPPED-ADDRESS attribute\n"
+    " --stun-backward-compatibility		        Add the deprecated MAPPED-ADDRESS attribute to STUN Binding\n"
+    "						responses, alongside XOR-MAPPED-ADDRESS, for clients that cannot "
+    "parse\n"
+    "						the latter. Strongly encouraged to keep it off to decrease gain factor "
+    "in\n"
+    "						STUN binding responses.\n"
+    " --rfc3489-compatibility			DEPRECATED. Enable handling of obsolete RFC 3489 (\"classic\" "
+    "STUN)\n"
+    "						Binding requests, which carry no magic cookie. Scheduled for removal "
+    "in\n"
+    "						the next major release; there is no replacement.\n"
+    " --rfc5766-channel-numbers			Accept ChannelBind channel numbers from the obsolete RFC 5766 "
+    "range 0x5000-0x7FFF,\n"
+    "						which RFC 8656 reserves for multiplexing collision avoidance "
+    "(RFC 7983). Only for\n"
+    "						compatibility with legacy clients; ChannelData on those "
+    "channels may be dropped by\n"
+    "						conformant demultiplexing endpoints.\n"
     " --respond-http-unsupported			Return an HTTP reponse with a 400 status code to HTTP "
     "connections made to ports not\n"
     "						supporting HTTP. The default behaviour is to immediately "
     "close the connection.\n"
-    " --drop-invalid-packets			   Drop invalid packets early. Enabled by default.\n"
     " --drop-invalid-packets-log			   Log invalid packets. The default behaviour is to not log "
     "invalid packets.\n"
 #if defined(__linux__)
@@ -1431,6 +1462,10 @@ static char Usage[] =
     " --multiplex-peer-port <port>\n"
     "        Base UDP port for multiplex-peer relay sockets. Default: 3480.\n"
     "        Total ports consumed = relay_threads * 2.\n"
+    " --multiplex-peer-max-peers <number>\n"
+    "        Maximum distinct peer IP:port endpoints one allocation may keep in\n"
+    "        the shared demux table. Further endpoints are refused with 508.\n"
+    "        Default: 256. Only meaningful with --multiplex-peer.\n"
     " --include-reason-string			   Include descriptive reason strings in STUN/TURN error responses.\n"
     "						   By default, only the standard reason phrase for the error code is\n"
     "						   sent. Enabling this option adds detailed error descriptions which\n"
@@ -1442,6 +1477,21 @@ static char Usage[] =
     "                                                 challenges off the server. Off by default.\n"
     " --unauthorized-ratelimit-rps=<count>           Max 401 Unauthorized responses to send per\n"
     "                                                 source IP per second (default 10).\n"
+    " --stateless-nonce                              Issue 401/438 challenge nonces as authenticated\n"
+    "                                                 timestamp cookies (issue time + HMAC over the\n"
+    "                                                 client address, keyed by a per-process secret)\n"
+    "                                                 instead of storing a random nonce in the\n"
+    "                                                 session. Unauthenticated UDP requests are then\n"
+    "                                                 answered without allocating per-client session\n"
+    "                                                 state, bounding memory under spoofed-source floods\n"
+    "                                                 of structurally valid STUN messages. On by default;\n"
+    "                                                 disable with --stateless-nonce=false.\n"
+    " --stateless-nonce-secret=<secret>              Derive the stateless-nonce signing key from this\n"
+    "                                                 secret instead of a random per-process key, so\n"
+    "                                                 servers sharing the secret (and NTP-synced clocks)\n"
+    "                                                 validate each other's nonces across restarts and\n"
+    "                                                 load-balanced fleets. Use a high-entropy string.\n"
+    "                                                 Implies --stateless-nonce.\n"
     " --version					Print version (and exit).\n"
     " -h						Help\n"
     "\n";
@@ -1515,7 +1565,7 @@ enum EXTRA_OPTS {
   NO_TCP_OPT,
   TCP_PROXY_PORT_OPT,
   NO_TLS_OPT,
-  NO_DTLS_OPT,
+  DTLS_OPT,
   NO_UDP_RELAY_OPT,
   NO_TCP_RELAY_OPT,
   TLS_PORT_OPT,
@@ -1605,9 +1655,10 @@ enum EXTRA_OPTS {
   NO_RFC5780,
   ENABLE_RFC5780,
   STUN_BACKWARD_COMPATIBILITY_OPT,
+  RFC5766_CHANNEL_NUMBERS_OPT,
+  RFC3489_COMPATIBILITY_OPT,
   RESPONSE_ORIGIN_ONLY_WITH_RFC5780_OPT,
   RESPOND_HTTP_UNSUPPORTED_OPT,
-  DROP_INVALID_PACKETS_OPT,
   DROP_INVALID_PACKETS_LOG_OPT,
 #if defined(__linux__)
   UDP_RECVMMSG_OPT,
@@ -1619,10 +1670,13 @@ enum EXTRA_OPTS {
   DRAIN_MIN_ALLOCATIONS_OPT,
   RATELIMIT_OPT,
   RATELIMIT_RPS_OPT,
+  STATELESS_NONCE_OPT,
+  STATELESS_NONCE_SECRET_OPT,
   CPUS_OPT,
   INCLUDE_REASON_STRING_OPT,
   OPT_MULTIPLEX_PEER = 800,
-  OPT_MULTIPLEX_PEER_PORT = 801
+  OPT_MULTIPLEX_PEER_PORT = 801,
+  OPT_MULTIPLEX_PEER_MAX_PEERS = 802
 };
 
 struct myoption {
@@ -1676,9 +1730,9 @@ static const struct myoption long_options[] = {
 #endif
 #if !defined(TURN_NO_PROMETHEUS)
     {"prometheus", optional_argument, NULL, PROMETHEUS_OPT},
-    {"prometheus-port", optional_argument, NULL, PROMETHEUS_PORT_OPT},
-    {"prometheus-address", optional_argument, NULL, PROMETHEUS_ADDRESS_OPT},
-    {"prometheus-path", optional_argument, NULL, PROMETHEUS_PATH_OPT},
+    {"prometheus-port", required_argument, NULL, PROMETHEUS_PORT_OPT},
+    {"prometheus-address", required_argument, NULL, PROMETHEUS_ADDRESS_OPT},
+    {"prometheus-path", required_argument, NULL, PROMETHEUS_PATH_OPT},
     {"prometheus-username-labels", optional_argument, NULL, PROMETHEUS_ENABLE_USERNAMES_OPT},
     {"prometheus-tls", optional_argument, NULL, PROMETHEUS_TLS_OPT},
     {"prometheus-cert", required_argument, NULL, PROMETHEUS_CERT_OPT},
@@ -1706,7 +1760,7 @@ static const struct myoption long_options[] = {
     {"no-udp", optional_argument, NULL, NO_UDP_OPT},
     {"no-tcp", optional_argument, NULL, NO_TCP_OPT},
     {"no-tls", optional_argument, NULL, NO_TLS_OPT},
-    {"no-dtls", optional_argument, NULL, NO_DTLS_OPT},
+    {"dtls", optional_argument, NULL, DTLS_OPT},
     {"no-udp-relay", optional_argument, NULL, NO_UDP_RELAY_OPT},
     {"no-tcp-relay", optional_argument, NULL, NO_TCP_RELAY_OPT},
     {"stale-nonce", optional_argument, NULL, STALE_NONCE_OPT},
@@ -1772,9 +1826,10 @@ static const struct myoption long_options[] = {
     {"no-rfc5780", optional_argument, NULL, NO_RFC5780},
     {"rfc5780", optional_argument, NULL, ENABLE_RFC5780},
     {"stun-backward-compatibility", optional_argument, NULL, STUN_BACKWARD_COMPATIBILITY_OPT},
+    {"rfc5766-channel-numbers", optional_argument, NULL, RFC5766_CHANNEL_NUMBERS_OPT},
+    {"rfc3489-compatibility", optional_argument, NULL, RFC3489_COMPATIBILITY_OPT},
     {"response-origin-only-with-rfc5780", optional_argument, NULL, RESPONSE_ORIGIN_ONLY_WITH_RFC5780_OPT},
     {"respond-http-unsupported", optional_argument, NULL, RESPOND_HTTP_UNSUPPORTED_OPT},
-    {"drop-invalid-packets", optional_argument, NULL, DROP_INVALID_PACKETS_OPT},
     {"drop-invalid-packets-log", optional_argument, NULL, DROP_INVALID_PACKETS_LOG_OPT},
 #if defined(__linux__)
     {"udp-recvmmsg", optional_argument, NULL, UDP_RECVMMSG_OPT},
@@ -1785,11 +1840,14 @@ static const struct myoption long_options[] = {
     {"include-reason-string", optional_argument, NULL, INCLUDE_REASON_STRING_OPT},
     {"multiplex-peer", no_argument, NULL, OPT_MULTIPLEX_PEER},
     {"multiplex-peer-port", required_argument, NULL, OPT_MULTIPLEX_PEER_PORT},
+    {"multiplex-peer-max-peers", required_argument, NULL, OPT_MULTIPLEX_PEER_MAX_PEERS},
     {"version", optional_argument, NULL, VERSION_OPT},
     {"syslog-facility", required_argument, NULL, SYSLOG_FACILITY_OPT},
     {"cpus", required_argument, NULL, CPUS_OPT},
     {"unauthorized-ratelimit", optional_argument, NULL, RATELIMIT_OPT},
     {"unauthorized-ratelimit-rps", optional_argument, NULL, RATELIMIT_RPS_OPT},
+    {"stateless-nonce", optional_argument, NULL, STATELESS_NONCE_OPT},
+    {"stateless-nonce-secret", required_argument, NULL, STATELESS_NONCE_SECRET_OPT},
     {NULL, no_argument, NULL, 0}};
 
 static const struct myoption admin_long_options[] = {
@@ -2524,11 +2582,12 @@ static void set_option(int c, char *value) {
     turn_params.no_tls = get_bool_value(value);
 #endif
     break;
-  case NO_DTLS_OPT:
+  case DTLS_OPT:
 #if DTLS_SUPPORTED
-    turn_params.no_dtls = get_bool_value(value);
+    turn_params.dtls = get_bool_value(value);
 #else
-    turn_params.no_dtls = true;
+    turn_params.dtls = false;
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "CONFIG: --dtls is ignored: this build has no DTLS support\n");
 #endif
     break;
   case CERT_FILE_OPT:
@@ -2619,13 +2678,16 @@ static void set_option(int c, char *value) {
   case STUN_BACKWARD_COMPATIBILITY_OPT:
     turn_params.stun_backward_compatibility = get_bool_value(value);
     break;
+  case RFC5766_CHANNEL_NUMBERS_OPT:
+    turn_params.rfc5766_channel_numbers = get_bool_value(value);
+    break;
+  case RFC3489_COMPATIBILITY_OPT:
+    turn_params.rfc3489_compatibility = get_bool_value(value);
+    break;
   case RESPONSE_ORIGIN_ONLY_WITH_RFC5780_OPT:
     break;
   case RESPOND_HTTP_UNSUPPORTED_OPT:
     turn_params.respond_http_unsupported = get_bool_value(value);
-    break;
-  case DROP_INVALID_PACKETS_OPT:
-    turn_params.drop_invalid_packets = get_bool_value(value);
     break;
   case DROP_INVALID_PACKETS_LOG_OPT:
     turn_params.drop_invalid_packets_log = get_bool_value(value);
@@ -2655,6 +2717,15 @@ static void set_option(int c, char *value) {
     }
     const uint16_t p = (uint16_t)parsed_port;
     turn_params.multiplex_peer_base_port = p;
+    break;
+  }
+  case OPT_MULTIPLEX_PEER_MAX_PEERS: {
+    const long parsed = strtol(value, NULL, 10);
+    if (parsed <= 0 || parsed > TURN_MP_PEERS_PER_SESSION_MAX) {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "--multiplex-peer-max-peers must be 1-%d\n", TURN_MP_PEERS_PER_SESSION_MAX);
+      exit(1);
+    }
+    turn_params.multiplex_peer_max_peers = (size_t)parsed;
     break;
   }
   case INCLUDE_REASON_STRING_OPT:
@@ -2689,6 +2760,26 @@ static void set_option(int c, char *value) {
     turn_params.ratelimit_unauthorized_requests_per_sec = v;
     TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Unauthorized rate-limit threshold: %d responses per second\n", v);
   } break;
+  case STATELESS_NONCE_OPT:
+    turn_params.stateless_nonce = get_bool_value(value);
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Stateless nonce mode is %s\n",
+                  turn_params.stateless_nonce ? "enabled" : "disabled");
+    break;
+  case STATELESS_NONCE_SECRET_OPT:
+    if (value && value[0] &&
+        turn_derive_stateless_nonce_key((const uint8_t *)value, strlen(value), turn_params.stateless_nonce_key,
+                                        sizeof(turn_params.stateless_nonce_key))) {
+      turn_params.stateless_nonce_key_set = true;
+      if (!turn_params.stateless_nonce) {
+        turn_params.stateless_nonce = true;
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Stateless nonce mode is enabled (implied by --stateless-nonce-secret)\n");
+      }
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Stateless nonce key derived from the configured secret\n");
+    } else {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING,
+                    "Ignoring empty or invalid --stateless-nonce-secret; an ephemeral random key will be used\n");
+    }
+    break;
 
   /* these options have been already taken care of before: */
   case 'l':
@@ -2839,7 +2930,7 @@ static void read_config_file(int argc, char **argv, int pass) {
           } else if ((pass == 0) && (c == LOG_MIN_LEVEL_OPT)) {
             set_log_min_level(value);
           } else if ((pass == 0) && (c == NEW_LOG_TIMESTAMP_OPT)) {
-            use_new_log_timestamp_format = 1;
+            use_new_log_timestamp_format = get_bool_value(value);
           } else if ((pass == 0) && (c == NEW_LOG_TIMESTAMP_FORMAT_OPT)) {
             set_turn_log_timestamp_format(value);
           } else if ((pass == 0) && (c == SYSLOG_FACILITY_OPT)) {
@@ -3033,7 +3124,8 @@ static int adminmain(int argc, char **argv) {
     case 'p':
       STRCPY(pwd, optarg);
       if (!SASLprep((uint8_t *)pwd)) {
-        TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Wrong password: %s\n", pwd);
+        /* Do not log the value: it is the password. */
+        TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Wrong password: contains a character prohibited by RFC 4013\n");
         exit(-1);
       }
       if (print_enc_password) {
@@ -3427,7 +3519,7 @@ int main(int argc, char **argv) {
         set_log_min_level(optarg);
         break;
       case NEW_LOG_TIMESTAMP_OPT:
-        use_new_log_timestamp_format = 1;
+        use_new_log_timestamp_format = get_bool_value(optarg);
         break;
       case NEW_LOG_TIMESTAMP_FORMAT_OPT:
         set_turn_log_timestamp_format(optarg);
@@ -3460,7 +3552,7 @@ int main(int argc, char **argv) {
 #endif
 
 #if !DTLS_SUPPORTED
-  turn_params.no_dtls = true;
+  turn_params.dtls = false;
 #endif
 
   if (strstr(argv[0], "turnadmin")) {
@@ -3545,6 +3637,17 @@ int main(int argc, char **argv) {
    * who want to opt out can pass --udp-recvmmsg=false. */
   turn_params.udp_sendmmsg = turn_params.multiplex_peer;
 #endif
+
+  if (turn_params.rfc3489_compatibility) {
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING,
+                  "DEPRECATED: --rfc3489-compatibility enables handling of obsolete RFC 3489 (\"classic\" STUN) "
+                  "Binding requests. RFC 5389 deprecated those mechanisms in 2008 and RFC 8489 dropped them "
+                  "entirely. This option is scheduled for removal in the next major release, with no "
+                  "replacement. If you still need it, please report your use case upstream.\n");
+    if (turn_params.no_stun) {
+      TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "--rfc3489-compatibility has no effect because --no-stun is also set.\n");
+    }
+  }
 
   if (turn_params.bps_capacity && !(turn_params.max_bps)) {
     TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR,
@@ -3788,6 +3891,17 @@ int main(int argc, char **argv) {
     ratelimit_init();
   }
 
+  if (turn_params.stateless_nonce && !turn_params.stateless_nonce_key_set) {
+    /* Process-wide ephemeral key for challenge nonces (no
+     * --stateless-nonce-secret configured). A restart invalidates outstanding
+     * nonces, which just re-triggers the standard 438 re-auth. */
+    if (RAND_bytes(turn_params.stateless_nonce_key, sizeof(turn_params.stateless_nonce_key)) != 1) {
+      for (size_t i = 0; i < sizeof(turn_params.stateless_nonce_key); ++i) {
+        turn_params.stateless_nonce_key[i] = (uint8_t)turn_random_number();
+      }
+    }
+  }
+
   setup_server();
 
 #if defined(WINDOWS)
@@ -3859,7 +3973,7 @@ static void adjust_key_file_name(char *fn, const char *file_title, int critical)
 keyerr:
   if (critical) {
     turn_params.no_tls = true;
-    turn_params.no_dtls = true;
+    turn_params.dtls = false;
     TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "cannot start TLS and DTLS listeners because %s file is not set properly\n",
                   file_title);
   }
@@ -4291,25 +4405,25 @@ static void openssl_setup(void) {
   }
 #endif
 
-  if (!(turn_params.no_tls && turn_params.no_dtls) && !turn_params.cert_file[0]) {
+  if ((!turn_params.no_tls || turn_params.dtls) && !turn_params.cert_file[0]) {
     TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "\nWARNING: certificate file is not specified, I cannot start TLS/DTLS "
                                           "services.\nOnly 'plain' UDP/TCP listeners can be started.\n");
     turn_params.no_tls = true;
-    turn_params.no_dtls = true;
+    turn_params.dtls = false;
   }
 
-  if (!(turn_params.no_tls && turn_params.no_dtls) && !turn_params.pkey_file[0]) {
+  if ((!turn_params.no_tls || turn_params.dtls) && !turn_params.pkey_file[0]) {
     TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "\nWARNING: private key file is not specified, I cannot start TLS/DTLS "
                                           "services.\nOnly 'plain' UDP/TCP listeners can be started.\n");
     turn_params.no_tls = true;
-    turn_params.no_dtls = true;
+    turn_params.dtls = false;
   }
 
-  if (!(turn_params.no_tls && turn_params.no_dtls)) {
+  if (!turn_params.no_tls || turn_params.dtls) {
     adjust_key_file_names();
   }
 
-  if (turn_params.tls_port_configured && turn_params.no_tls && turn_params.no_dtls) {
+  if (turn_params.tls_port_configured && turn_params.no_tls && !turn_params.dtls) {
     TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR,
                   "tls-listening-port %d is configured, but the TLS and DTLS listeners are disabled "
                   "(see the messages above). The server will NOT listen on that port. Set valid 'cert' and "
@@ -4344,7 +4458,7 @@ static void openssl_load_certificates(void) {
 #endif
   }
 
-  if (!turn_params.no_dtls) {
+  if (turn_params.dtls) {
 #if !DTLS_SUPPORTED
     TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "ERROR: DTLS is not supported.\n");
 #else
@@ -4355,6 +4469,10 @@ static void openssl_load_certificates(void) {
     setup_dtls_callbacks(turn_params.dtls_ctx);
     TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "DTLS cipher suite: %s\n", turn_params.cipher_list);
 #endif
+  } else if (!turn_params.no_tls) {
+    /* The certificates are usable, so the operator may well have expected the
+     * DTLS listeners to come up with the TLS ones. */
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "DTLS listeners are not started; use --dtls to start them\n");
   }
   TURN_MUTEX_UNLOCK(&turn_params.tls_mutex);
 }

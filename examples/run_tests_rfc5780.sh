@@ -82,10 +82,10 @@ echo "Running turnserver with RFC 5780 enabled on $PRIMARY_IP + $ALT_IP"
 $BINDIR/turnserver \
     --use-auth-secret --static-auth-secret=secret --realm=north.gov \
     --allow-loopback-peers --rfc5780 \
-    --no-cli --no-tls --no-dtls \
+    --no-tls \
     --listening-ip=$PRIMARY_IP --listening-ip=$ALT_IP \
     --min-port=49152 --max-port=49300 \
-    --log-file=stdout --simple-log > "$TURNSERVER_LOG" 2>&1 &
+    --log-file=stdout > "$TURNSERVER_LOG" 2>&1 &
 turnserver_pid="$!"
 
 # Poll our uniquely-named log for a known late-startup line instead of racing

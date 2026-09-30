@@ -778,7 +778,8 @@ address family is the same as the family of the client socket).
 TURN Server public/private address mapping, if the server is behind NAT.
 In that situation, if a \-X is used in form "\-X <ip>" then that ip will be reported
 .RE
-as relay IP address of all allocations. This scenario works only in a simple case
+as relay IP address of all allocations of its own address family (a relay of the
+other family is reported under its own address). This scenario works only in a simple case
 when one single relay address is be used, and no CHANGE_REQUEST functionality is
 required. That single relay address must be mapped by NAT to the 'external' IP.
 The "external\-ip" value, if not empty, is returned in XOR\-RELAYED\-ADDRESS field.
@@ -1253,7 +1254,24 @@ DEPRECATED and now the default behaviour. See \-\-rfc5780.
 .TP
 .B
 \fB\-\-stun\-backward\-compatibility\fP
-Enable handling old STUN Binding requests using MAPPED\-ADDRESS attribute in binding response (instead of XOR\-MAPPED\-ADDRESS).
+Add the deprecated MAPPED\-ADDRESS attribute to STUN Binding responses, in addition to the
+XOR\-MAPPED\-ADDRESS attribute that is always sent. Only needed for clients that cannot parse
+XOR\-MAPPED\-ADDRESS. Strongly encouraged to keep this option off to decrease gain factor in
+STUN binding responses.
+.RE
+
+.RS
+.TP
+.B
+\fB\-\-rfc3489\-compatibility\fP
+DEPRECATED. Enable handling of obsolete RFC 3489 ("classic" STUN) Binding requests, which carry
+no magic cookie. RFC 5389 deprecated these mechanisms and RFC 8489 dropped them entirely. This
+option is scheduled for removal in the next major release, with no replacement.
+.IP
+Before this option existed, the RFC 3489 request path was controlled by
+\fB\-\-stun\-backward\-compatibility\fP. Operators who set that option in order to serve
+classic\-STUN clients should now set \fB\-\-rfc3489\-compatibility\fP instead, or both options to
+retain the exact previous behavior.
 .RE
 
 .RS
@@ -1268,6 +1286,25 @@ source address to receive authentication challenges. Disabled by default.
 \fB\-\-unauthorized\-ratelimit\-rps\fP=<count>
 Maximum number of UDP 401 Unauthorized responses sent per source IP
 per second. Default is 10.
+.TP
+.B
+\fB\-\-stateless\-nonce\fP
+Issue 401/438 challenge nonces as authenticated timestamp cookies (issue
+time plus an HMAC over the client address, keyed by a per\-process
+secret) instead of storing a random nonce in per\-client session state. Unauthenticated UDP requests are then
+answered without allocating a session, bounding server memory under
+spoofed\-source floods of structurally valid STUN messages.
+Wire\-compatible with standard TURN clients. Enabled by default; disable
+with \-\-stateless\-nonce=false, which restores the stored random nonce and
+the legacy 16\-character challenge in place of the 24\-character one.
+.TP
+.B
+\fB\-\-stateless\-nonce\-secret\fP=<secret>
+Derive the stateless\-nonce signing key from this secret instead of a
+random per\-process key (implies \-\-stateless\-nonce). Servers sharing
+the secret validate each other's nonces, so challenges survive restarts
+and work across a load\-balanced fleet. Use a long, high\-entropy string
+and keep fleet clocks NTP\-synced.
 .RE
 .PP
 

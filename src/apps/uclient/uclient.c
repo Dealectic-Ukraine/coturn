@@ -152,7 +152,11 @@ static int client_shutdown(app_ur_session *elem);
 static uint64_t current_time = 0;
 static uint64_t current_mstime = 0;
 
-static char buffer_to_send[65536] = "\0";
+/* Constant payload filler, written once during setup and only read afterwards.
+ * It must stay immutable: every sender thread copies from it concurrently, so
+ * anything stamped here would be shared between sessions. Per-send fields go
+ * into the outgoing packet via stamp_message_info(). */
+static char payload_template[65536] = "\0";
 
 static int total_clients = 0;
 
@@ -322,7 +326,11 @@ static void *uclient_listener_thread_main(void *arg) {
   return NULL;
 }
 
-static int start_listener_threads(void) {
+/* Build the pool's per-listener state and event bases without running any of
+ * them yet. Session creation needs pick_listener_base() to hand out a base, so
+ * this must happen before start_client / start_c2c; the threads themselves are
+ * spawned later by start_listener_threads(). */
+static int init_listener_pool(void) {
   /* Show how the pool is configured for this run, regardless of whether
    * the count came from -K or auto-scaling. Surfacing the actual number
    * (and whether it was auto-derived) is the only way an operator can
@@ -345,6 +353,17 @@ static int start_listener_threads(void) {
     listeners[i].l_min_latency = 0xFFFFFFFFu;
     listeners[i].l_min_jitter = 0xFFFFFFFFu;
     listeners[i].stop = 0;
+  }
+  TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "uclient: listener pool configured for %d thread(s) (%s)\n", num_listener_threads,
+                origin);
+  return 0;
+}
+
+static int start_listener_threads(void) {
+  if (num_listener_threads <= 0 || !listeners) {
+    return 0;
+  }
+  for (int i = 0; i < num_listener_threads; ++i) {
     if (pthread_create(&listeners[i].thread, NULL, uclient_listener_thread_main, &listeners[i]) != 0) {
       TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "uclient: pthread_create listener %d failed\n", i);
       /* Leave started=false so stop_listener_threads doesn't pthread_join
@@ -354,7 +373,7 @@ static int start_listener_threads(void) {
     }
     listeners[i].started = true;
   }
-  TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "uclient: started %d listener thread(s) (%s)\n", num_listener_threads, origin);
+  TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "uclient: started %d listener thread(s)\n", num_listener_threads);
   return 0;
 }
 
@@ -799,7 +818,11 @@ static void *uclient_sender_thread_main(void *arg) {
   return NULL;
 }
 
-static int start_sender_threads(void) {
+/* Counterpart to init_listener_pool(): build the sender state and arm each
+ * per-sender timer, but do not run them. pick_sender_id() needs the array
+ * during session creation; the threads start once every session exists. The
+ * armed timers stay dormant until their base is dispatched by the thread. */
+static int init_sender_pool(void) {
   const char *origin = num_sender_threads_explicit ? "explicit -J" : "auto";
   if (num_sender_threads <= 0) {
     TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "uclient: sender pool disabled (single-threaded send on main; %s)\n", origin);
@@ -829,14 +852,24 @@ static int start_sender_threads(void) {
     tv.tv_sec = 0;
     tv.tv_usec = (is_packet_flood_mode() || is_invalid_flood_mode()) ? 100 : 1000;
     evtimer_add(senders[i].timer_ev, &tv);
+  }
+  TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "uclient: sender pool configured for %d thread(s) (%s)\n", num_sender_threads,
+                origin);
+  return 0;
+}
 
+static int start_sender_threads(void) {
+  if (num_sender_threads <= 0 || !senders) {
+    return 0;
+  }
+  for (int i = 0; i < num_sender_threads; ++i) {
     if (pthread_create(&senders[i].thread, NULL, uclient_sender_thread_main, &senders[i]) != 0) {
       TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "uclient: pthread_create sender %d failed\n", i);
       return -1;
     }
     senders[i].started = true;
   }
-  TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "uclient: started %d sender thread(s) (%s)\n", num_sender_threads, origin);
+  TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "uclient: started %d sender thread(s)\n", num_sender_threads);
   return 0;
 }
 
@@ -1909,6 +1942,24 @@ static int client_shutdown(app_ur_session *elem) {
   return 0;
 }
 
+/* Write this send's sequence number and timestamp into the outgoing packet.
+ * The peer echoes them back and client_read() derives loss, latency and jitter
+ * from them, so they must describe this session's send and no other: stamping
+ * them into the shared payload_template instead let a second sender thread
+ * overwrite them between the stamp and the copy, and the packet then carried
+ * another session's values. memcpy because the destination sits at an
+ * arbitrary offset in the message and mstime is 64-bit.
+ * clmessage_length >= sizeof(message_info) is enforced in mainuclient.c for
+ * every mode that stamps. */
+static void stamp_message_info(void *payload, const app_ur_session *elem) {
+  /* Zero-initialized: message_info has padding between msgnum and mstime, and
+   * the whole struct is copied onto the wire. */
+  message_info mi = {0};
+  mi.msgnum = elem->wmsgnum;
+  mi.mstime = current_mstime;
+  memcpy(payload, &mi, sizeof(mi));
+}
+
 static int client_write(app_ur_session *elem) {
 
   if (!elem) {
@@ -1935,15 +1986,12 @@ static int client_write(app_ur_session *elem) {
       memcpy(elem->out_buffer.buf + 4, &(elem->wmsgnum), sizeof(elem->wmsgnum));
     }
     elem->out_buffer.len = payload_len;
-  } else {
-    message_info *mi = (message_info *)buffer_to_send;
-    mi->msgnum = elem->wmsgnum;
-    mi->mstime = current_mstime;
   }
 
   if (!is_invalid_flood_mode() && is_TCP_relay()) {
 
-    memcpy(elem->out_buffer.buf, buffer_to_send, clmessage_length);
+    memcpy(elem->out_buffer.buf, payload_template, clmessage_length);
+    stamp_message_info(elem->out_buffer.buf, elem);
     elem->out_buffer.len = clmessage_length;
 
     if (elem->pinfo.is_peer) {
@@ -1968,10 +2016,15 @@ static int client_write(app_ur_session *elem) {
   } else if (!is_invalid_flood_mode() && !do_not_use_channel) {
     /* Let's always do padding: */
     stun_init_channel_message(elem->chnum, &(elem->out_buffer), clmessage_length, mandatory_channel_padding || use_tcp);
-    memcpy(elem->out_buffer.buf + 4, buffer_to_send, clmessage_length);
+    memcpy(elem->out_buffer.buf + 4, payload_template, clmessage_length);
+    stamp_message_info(elem->out_buffer.buf + 4, elem);
   } else if (!is_invalid_flood_mode()) {
     stun_init_indication(STUN_METHOD_SEND, &(elem->out_buffer));
-    stun_attr_add(&(elem->out_buffer), STUN_ATTRIBUTE_DATA, buffer_to_send, clmessage_length);
+    /* The DATA value lands 4 bytes (the attribute header) past the current end
+     * of the message, so capture that before appending. */
+    const size_t data_offset = elem->out_buffer.len + 4;
+    stun_attr_add(&(elem->out_buffer), STUN_ATTRIBUTE_DATA, payload_template, clmessage_length);
+    stamp_message_info(elem->out_buffer.buf + data_offset, elem);
     stun_attr_add_addr(&(elem->out_buffer), STUN_ATTRIBUTE_XOR_PEER_ADDRESS, &(elem->pinfo.peer_addr));
     if (dont_fragment) {
       stun_attr_add(&(elem->out_buffer), STUN_ATTRIBUTE_DONT_FRAGMENT, NULL, 0);
@@ -2070,7 +2123,9 @@ static void client_discard_input_handler(evutil_socket_t fd, short what, void *a
     return;
   }
 
-  uint8_t buffer[STUN_BUFFER_SIZE];
+  /* Received bytes are discarded, so the drain loop just needs somewhere to put
+   * them — a full STUN_BUFFER_SIZE frame on a listener thread buys nothing. */
+  uint8_t buffer[4096];
 
   if (elem->pinfo.ssl) {
     int rc = 0;
@@ -2228,6 +2283,11 @@ static void start_allocation_flood(const char *remote_address, uint16_t port, co
   synthetic_peer_counter = 0;
   reset_load_generator_rate_stats();
 
+  /* Each app_ur_session carries two ~64 KB stun_buffers. Allocate the pair once
+   * and reset it per iteration rather than paying for it in the frame. */
+  app_ur_session *ss_probe = (app_ur_session *)turn_calloc(1, sizeof(app_ur_session));
+  app_ur_session *ss_alloc = (app_ur_session *)turn_calloc(1, sizeof(app_ur_session));
+
   while (unlimited || (tot_allocations < total_target)) {
     for (int i = 0; i < mclient; ++i) {
       app_ur_conn_info clnet_info_probe;
@@ -2248,16 +2308,14 @@ static void start_allocation_flood(const char *remote_address, uint16_t port, co
 
       turn_refresh_allocation(clnet_verbose, &clnet_info, 0);
 
-      app_ur_session ss_probe;
-      app_ur_session ss_alloc;
-      memset(&ss_probe, 0, sizeof(ss_probe));
-      memset(&ss_alloc, 0, sizeof(ss_alloc));
-      ss_probe.pinfo = clnet_info_probe;
-      ss_alloc.pinfo = clnet_info;
-      if (ss_probe.pinfo.fd >= 0 || ss_probe.pinfo.ssl) {
-        uc_delete_session_elem_data(&ss_probe);
+      memset(ss_probe, 0, sizeof(*ss_probe));
+      memset(ss_alloc, 0, sizeof(*ss_alloc));
+      ss_probe->pinfo = clnet_info_probe;
+      ss_alloc->pinfo = clnet_info;
+      if (ss_probe->pinfo.fd >= 0 || ss_probe->pinfo.ssl) {
+        uc_delete_session_elem_data(ss_probe);
       }
-      uc_delete_session_elem_data(&ss_alloc);
+      uc_delete_session_elem_data(ss_alloc);
 
       ++tot_allocations;
 
@@ -2274,6 +2332,9 @@ static void start_allocation_flood(const char *remote_address, uint16_t port, co
       }
     }
   }
+
+  free(ss_probe);
+  free(ss_alloc);
 
   __turn_getMSTime();
   print_load_generator_rate(__FUNCTION__);
@@ -2422,17 +2483,19 @@ static int start_c2c(const char *remote_address, uint16_t port, const unsigned c
 
 static int refresh_channel(app_ur_session *elem, uint16_t method, uint32_t lt) {
 
-  stun_buffer message;
   app_ur_conn_info *clnet_info = &(elem->pinfo);
 
   if (clnet_info->is_peer) {
     return 0;
   }
 
+  int ret = 0;
+  stun_buffer *message = (stun_buffer *)turn_calloc(1, sizeof(stun_buffer));
+
   if (!method || (method == STUN_METHOD_REFRESH)) {
-    stun_init_request(STUN_METHOD_REFRESH, &message);
+    stun_init_request(STUN_METHOD_REFRESH, message);
     lt = htonl(lt);
-    stun_attr_add(&message, STUN_ATTRIBUTE_LIFETIME, (const char *)&lt, 4);
+    stun_attr_add(message, STUN_ATTRIBUTE_LIFETIME, (const char *)&lt, 4);
 
     if (dual_allocation && !mobility) {
       int t = ((uint8_t)turn_random_number()) % 3;
@@ -2443,55 +2506,62 @@ static int refresh_channel(app_ur_session *elem, uint16_t method, uint32_t lt) {
         field[1] = 0;
         field[2] = 0;
         field[3] = 0;
-        stun_attr_add(&message, STUN_ATTRIBUTE_REQUESTED_ADDRESS_FAMILY, (const char *)field, 4);
+        stun_attr_add(message, STUN_ATTRIBUTE_REQUESTED_ADDRESS_FAMILY, (const char *)field, 4);
       }
     }
 
-    add_origin(&message);
-    if (add_integrity(clnet_info, &message) < 0) {
-      return -1;
+    add_origin(message);
+    if (add_integrity(clnet_info, message) < 0) {
+      ret = -1;
+      goto done;
     }
     if (use_fingerprints) {
-      stun_attr_add_fingerprint_str(message.buf, (size_t *)&(message.len));
+      stun_attr_add_fingerprint_str(message->buf, (size_t *)&(message->len));
     }
-    send_buffer(clnet_info, &message, 0, 0);
+    send_buffer(clnet_info, message, 0, 0);
   }
 
   if (lt && !addr_any(&(elem->pinfo.peer_addr))) {
 
     if (!no_permissions) {
       if (!method || (method == STUN_METHOD_CREATE_PERMISSION)) {
-        stun_init_request(STUN_METHOD_CREATE_PERMISSION, &message);
-        stun_attr_add_addr(&message, STUN_ATTRIBUTE_XOR_PEER_ADDRESS, &(elem->pinfo.peer_addr));
-        add_origin(&message);
-        if (add_integrity(clnet_info, &message) < 0) {
-          return -1;
+        stun_init_request(STUN_METHOD_CREATE_PERMISSION, message);
+        stun_attr_add_addr(message, STUN_ATTRIBUTE_XOR_PEER_ADDRESS, &(elem->pinfo.peer_addr));
+        add_origin(message);
+        if (add_integrity(clnet_info, message) < 0) {
+          ret = -1;
+          goto done;
         }
         if (use_fingerprints) {
-          stun_attr_add_fingerprint_str(message.buf, (size_t *)&(message.len));
+          stun_attr_add_fingerprint_str(message->buf, (size_t *)&(message->len));
         }
-        send_buffer(&(elem->pinfo), &message, 0, 0);
+        send_buffer(&(elem->pinfo), message, 0, 0);
       }
     }
 
     if (!method || (method == STUN_METHOD_CHANNEL_BIND)) {
       if (STUN_VALID_CHANNEL(elem->chnum)) {
-        stun_set_channel_bind_request(&message, &(elem->pinfo.peer_addr), elem->chnum);
-        add_origin(&message);
-        if (add_integrity(clnet_info, &message) < 0) {
-          return -1;
+        stun_set_channel_bind_request(message, &(elem->pinfo.peer_addr), elem->chnum);
+        add_origin(message);
+        if (add_integrity(clnet_info, message) < 0) {
+          ret = -1;
+          goto done;
         }
         if (use_fingerprints) {
-          stun_attr_add_fingerprint_str(message.buf, (size_t *)&(message.len));
+          stun_attr_add_fingerprint_str(message->buf, (size_t *)&(message->len));
         }
-        send_buffer(&(elem->pinfo), &message, 1, 0);
+        send_buffer(&(elem->pinfo), message, 1, 0);
       }
     }
   }
 
   elem->refresh_time = current_mstime + 30 * 1000;
 
-  return 0;
+done:
+
+  free(message);
+
+  return ret;
 }
 
 static inline int client_timer_handler(app_ur_session *elem, int *done) {
@@ -2675,7 +2745,7 @@ void start_mclient(const char *remote_address, uint16_t port, const unsigned cha
   uint32_t stime = current_time;
   reset_load_generator_rate_stats();
 
-  memset(buffer_to_send, 7, clmessage_length);
+  memset(payload_template, 7, clmessage_length);
 
   client_event_base = turn_event_base_new();
 
@@ -2691,12 +2761,12 @@ void start_mclient(const char *remote_address, uint16_t port, const unsigned cha
     num_listener_threads = UCLIENT_AUTO_LISTENERS_TARGET;
   }
 
-  /* Start the listener thread pool BEFORE any session creation. Each new
+  /* Configure the listener pool BEFORE any session creation. Each new
    * session's recv events will be registered against the assigned
    * listener's event_base via pick_listener_base() inside start_client /
-   * start_c2c. The pool runs concurrently with the main thread for the
-   * lifetime of the test. */
-  if (start_listener_threads() < 0) {
+   * start_c2c. The threads are spawned only once every session exists -
+   * see start_listener_threads() below. */
+  if (init_listener_pool() < 0) {
     /* Falling back to legacy single-threaded model is safer than aborting
      * a load test; pick_listener_base() returns client_event_base when
      * num_listener_threads is 0 or listeners is NULL. */
@@ -2713,11 +2783,11 @@ void start_mclient(const char *remote_address, uint16_t port, const unsigned cha
     num_sender_threads = UCLIENT_AUTO_SENDERS_TARGET;
   }
 
-  /* Start the sender thread pool BEFORE start_full_timer is set so the
+  /* Configure the sender pool BEFORE start_full_timer is set so the
    * per-sender timers exist by the time iteration begins. Session
    * sender_id assignment happens during create_new_ss / per-session
-   * setup (pick_sender_id), so the pool must be live at that point. */
-  if (start_sender_threads() < 0) {
+   * setup (pick_sender_id), so the array must exist at that point. */
+  if (init_sender_pool() < 0) {
     TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "uclient: sender pool init failed, falling back to single-threaded\n");
     num_sender_threads = 0;
   }
@@ -2778,6 +2848,19 @@ void start_mclient(const char *remote_address, uint16_t port, const unsigned cha
   }
 
   total_clients = tot_clients;
+
+  /* Only now start the pools. Session creation runs TLS handshakes and builds
+   * MESSAGE-INTEGRITY on the main thread, and a listener verifying integrity
+   * concurrently touches the same OpenSSL library state - freeing it here
+   * while a worker reads it is a data race ThreadSanitizer reports against
+   * libcrypto. Spawning after the last session also means senders never
+   * iterate elems[] while it is still being appended to.
+   * A spawn failure cannot fall back to single-threaded: sessions are already
+   * bound to listener bases that would then never be dispatched. */
+  if (start_listener_threads() < 0 || start_sender_threads() < 0) {
+    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "uclient: cannot start worker threads\n");
+    exit(-1);
+  }
 
   __turn_getMSTime();
 

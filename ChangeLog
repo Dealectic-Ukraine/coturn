@@ -1,3 +1,116 @@
+Release 4.18.0
+
+Changelist:
+- Update help with missing arguments (#2079) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Add missing cli arguments to help (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Deprecate option drop-invalid-packets (#2078) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Replace ubuntu 24.04 with 26.04LTS (#2076) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- hiredis: clean up failed async connection setup (#2073) (Junki Lee <junkilee80@gmail.com>)
+- reject 0x1f control character in SASLprep (#2074) (alhuda <50839256+alhudz@users.noreply.github.com>)
+- Return allocation mismatch for ChannelBind without allocation (#2067) (pannal <1359593+pannal@users.noreply.github.com>)
+- Silently ignore attributes after message-integrity (#2075) (Philipp Hancke <philipp.hancke@googlemail.com>)
+- Move session id out of log message prefixes (#2072) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Split unauthorized reason (#2065) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Make the multiplex-peer example tests request EVEN-PORT never, not ra… (#2070) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Log only the request line for web-admin HTTP requests (#2069) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- fix: shrink oversized stack frames flagged by MSVC C6262 (#2068) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Merge commit from fork (Pavel Punsky <eakraly@users.noreply.github.com>)
+- fix: external ip must valid if the provider responses EDNS (#2060) (tangxinfa <tangxinfa@gmail.com>)
+- skip null memcpy on zero-length stun auth attribute (#2066) (alhuda <50839256+alhudz@users.noreply.github.com>)
+- Log only the request line for web-admin HTTP requests (#2064) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- ci: guard against test-script hangs (timeout wrappers + job timeouts) (#2061) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- turnutils_peer: reflect DSCP/TOS on echoed datagrams (#2059) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Advertise IPv6 allocations under their real relayed transport address (#2058) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Build docker images with optimizations on (#2057) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- don't release port 65535 when turnports_allocate fails (#2056) (alhuda <50839256+alhudz@users.noreply.github.com>)
+- Document RFC 8489 and RFC 8656 instead of only the specs they obsolete (#2049) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Size USERNAME, REALM and NONCE limits in bytes per RFC 8489 (#2047) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Bind the first XOR-PEER-ADDRESS in ChannelBind, not the last (#2048) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Ignore a duplicate DATA attribute in Send instead of discarding (#2046) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- uclient: stamp per-send metadata into the packet, not a shared buffer (#2053) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- uclient: start the worker pools after session creation, not before (#2052) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- clamp software copy length in handle_old_stun_command (#2050) (alhuda <50839256+alhudz@users.noreply.github.com>)
+- fix: shrink oversized stack frames in the test utilities (#2051) (Pavel Punsky <eakraly@users.noreply.github.com>)
+
+Contributors:
+- Junki Lee <junkilee80@gmail.com>
+- Kai Ren <tyranron@gmail.com>
+- Pavel Punsky <eakraly@users.noreply.github.com>
+- Philipp Hancke <philipp.hancke@googlemail.com>
+- alhuda <50839256+alhudz@users.noreply.github.com>
+- dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>
+- pannal <1359593+pannal@users.noreply.github.com>
+- tangxinfa <tangxinfa@gmail.com>
+
+Release 4.17.2
+
+Changelist:
+- Fix outgoing UDP TTL pinned to 1 on client-facing sockets (#2045) (Pavel Punsky <eakraly@users.noreply.github.com>)
+
+Contributors:
+- Pavel Punsky <eakraly@users.noreply.github.com>
+
+Release 4.17.1
+
+Changelist:
+- Flash before socket close (#2041) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- build: Drop ginstall detection in configure (#2038) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Gate merges on the more tests suites (#2039) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- docker: Fix test for image version (Kai Ren <tyranron@gmail.com>)
+- docker: Upgrade Coturn to 4.17.0 version (Kai Ren <tyranron@gmail.com>)
+
+Contributors:
+- Kai Ren <tyranron@gmail.com>
+- Pavel Punsky <eakraly@users.noreply.github.com>
+- dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>
+
+Release 4.17.0
+
+Changelist:
+- Enable stateless nonce by default  (#2036) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Emit exactly one log line per record (#2033) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Keep the legacy random nonce at 16 chars (#2032) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Log format: ISO-8601 timestamp by default, no thread id, space delimiter (#2031) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Fix localtime() data race in the logger (#2030) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Remove syslog from the Docker Compose turnserver.conf (#2029) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Drop --simple-log where it is a no-op alongside --log-file=stdout (#2028) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Do not ask the kernel for an outgoing IP TTL of zero (#2027) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Start the DTLS listeners only when --dtls is given (#2026) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Worktree stateless nonce mi fastpath (#2025) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Binding stateless fastpath (#2024) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Free the secrets list on the get_user_key error paths (#2019) (alhuda <50839256+alhudz@users.noreply.github.com>)
+
+Contributors:
+- Pavel Punsky <eakraly@users.noreply.github.com>
+- alhuda <50839256+alhudz@users.noreply.github.com>
+
+Release 4.16.0
+
+Changelist:
+- tests: broaden TURN server core coverage to Send and CreatePermission (#2018) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- multiplex-peer: bound the shared per-thread peer demux table (#2017) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Send: make a duplicate XOR-PEER-ADDRESS first-wins instead of last-wins (#2016) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Declare ERROR-CODE / ADDRESS-ERROR-CODE reason phrases without padding (#2015) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- docs: state the comment style expected in CLAUDE.md (#2014) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- DTLS: release idle handshake buffers on half-open sockets (#2013) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- docs: state OpenSSL 3.0+ as the supported target; drop stale guidance (#2011) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- DTLS: cap concurrent half-open handshakes (pre-cookie state-exhaustion) (#2012) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- DTLS: drop non-handshake records from unknown sources (#2010) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- docs: record the RFC 3489 deprecation roadmap; fix stale option text (#2009) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Split --stun-backward-compatibility: move RFC 3489 handling to its own deprecated flag (#2008) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Narrow ChannelBind to the RFC 8656 channel range 0x4000-0x4FFF (#2006) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Return 508, not 400/440, when a well-formed Allocate cannot be satisfied (#2007) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Fix NULL deref: --prometheus-address/-path/-port take a required value (#2005) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- DTLS listener: correct the handshake buffer bound and remove the non-functional client-cert path (#2003) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- docs: cite RFC 7350 for DTLS support in README (#2004) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Add --stateless-nonce: bound memory under valid-structure STUN floods (#1999) (#2002) (Pavel Punsky <eakraly@users.noreply.github.com>)
+- Restore support for hiredis < 1.1.0 (for AlmaLinux/RHEL/Rocky Linux 9) (#2001) (Robert Scheck <robert-scheck@users.noreply.github.com>)
+
+Contributors:
+- Kai Ren <tyranron@gmail.com>
+- Pavel Punsky <eakraly@users.noreply.github.com>
+- Robert Scheck <robert-scheck@users.noreply.github.com>
+
 Release 4.15.0
 
 Changelist:

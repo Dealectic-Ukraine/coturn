@@ -534,7 +534,7 @@ static bool can_auth_message_inline(const struct auth_message *am) {
 void send_auth_message_to_auth_server(struct auth_message *am) {
   if (can_auth_message_inline(am)) {
     if (get_user_key(am->in_oauth, &(am->out_oauth), &(am->max_session_time), am->username, am->realm, am->key,
-                     am->in_buffer.nbh) < 0) {
+                     am->in_buffer.nbh, &(am->key_lookup)) < 0) {
       am->success = 0;
     } else {
       am->success = 1;
@@ -568,7 +568,7 @@ static void auth_server_receive_message(struct bufferevent *bev, void *ptr) {
     }
 
     if (get_user_key(am->in_oauth, &(am->out_oauth), &(am->max_session_time), am->username, am->realm, am->key,
-                     am->in_buffer.nbh) < 0) {
+                     am->in_buffer.nbh, &(am->key_lookup)) < 0) {
       am->success = 0;
     } else {
       am->success = 1;
@@ -841,8 +841,8 @@ static int handle_relay_message(relay_server_handle rs, struct message_to_relay 
 }
 
 static void handle_relay_auth_message(struct relay_server *rs, struct auth_message *am) {
-  am->resume_func(am->success, am->out_oauth, am->max_session_time, am->key, am->pwd, &(rs->server), am->ctxkey,
-                  &(am->in_buffer), am->realm);
+  am->resume_func(am->success, am->key_lookup, am->out_oauth, am->max_session_time, am->key, am->pwd, &(rs->server),
+                  am->ctxkey, &(am->in_buffer), am->realm);
   if (am->in_buffer.nbh) {
     ioa_network_buffer_delete(rs->ioa_eng, am->in_buffer.nbh);
     am->in_buffer.nbh = NULL;
@@ -1068,7 +1068,7 @@ static void setup_socket_per_thread_udp_listener_servers(void) {
 
     const int index = i;
 
-    if (!turn_params.no_udp || !turn_params.no_dtls) {
+    if (!turn_params.no_udp || turn_params.dtls) {
 
       ioa_addr addr;
       char saddr[MAX_IOA_ADDR_STRING];
@@ -1127,7 +1127,7 @@ static void setup_socket_per_thread_udp_listener_servers(void) {
         turn_params.listener.udp_services[index + 1] = NULL;
       }
     }
-    if (!turn_params.no_dtls && (turn_params.no_udp || (turn_params.listener_port != turn_params.tls_listener_port))) {
+    if (turn_params.dtls && (turn_params.no_udp || (turn_params.listener_port != turn_params.tls_listener_port))) {
 
       turn_params.listener.dtls_services[index] = (dtls_listener_relay_server_type **)allocate_super_memory_engine(
           turn_params.listener.ioa_eng,
@@ -1381,11 +1381,15 @@ static void setup_relay_server(struct relay_server *rs, ioa_engine_handle e, int
       turn_params.server_relay, send_turn_session_info, send_https_socket, turn_params.sock_buf_size, allocate_bps,
       turn_params.oauth, turn_params.oauth_server_name, turn_params.acme_redirect,
       turn_params.allocation_default_address_family, &turn_params.log_binding, &turn_params.stun_backward_compatibility,
-      &turn_params.respond_http_unsupported, turn_params.include_reason_string,
-      &turn_params.ratelimit_unauthorized_requests, &turn_params.ratelimit_unauthorized_requests_per_sec);
+      &turn_params.rfc5766_channel_numbers, &turn_params.rfc3489_compatibility, &turn_params.respond_http_unsupported,
+      turn_params.include_reason_string, &turn_params.ratelimit_unauthorized_requests,
+      &turn_params.ratelimit_unauthorized_requests_per_sec);
   set_unauthenticated_401_metric_cbs(&(rs->server), prom_inc_unauthenticated_401_request,
                                      prom_inc_unauthenticated_401_response,
                                      prom_inc_unauthenticated_401_dropped_response);
+  set_auth_credential_failure_metric_cb(&(rs->server), prom_inc_auth_credential_failure);
+  set_stateless_nonce(&(rs->server), &turn_params.stateless_nonce, turn_params.stateless_nonce_key,
+                      sizeof(turn_params.stateless_nonce_key));
   if (to_set_rfc5780) {
     set_rfc5780(&(rs->server), get_alt_addr, send_message_from_listener_to_client);
   }
@@ -1395,7 +1399,7 @@ static void setup_relay_server(struct relay_server *rs, ioa_engine_handle e, int
 #if defined(__linux__)
   if (turn_params.multiplex_peer) {
     const uint16_t base = turn_params.multiplex_peer_base_port ? turn_params.multiplex_peer_base_port : 3480;
-    if (init_multiplex_peer(rs->ioa_eng, (int)rs->id, base) == 0) {
+    if (init_multiplex_peer(rs->ioa_eng, (int)rs->id, base, turn_params.multiplex_peer_max_peers) == 0) {
       rs->server.multiplex_peer_mode = true;
     } else {
       TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING,

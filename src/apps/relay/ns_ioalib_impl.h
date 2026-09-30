@@ -43,6 +43,7 @@
 
 #include "ns_turn_openssl.h"
 
+#include "mp_peer_table.h"
 #include "ns_turn_maps.h"
 #include "ns_turn_maps_rtcp.h"
 #include "ns_turn_server.h"
@@ -205,7 +206,7 @@ struct _ioa_engine {
   ioa_socket_handle mp_sock_v6;
   uint16_t mp_port_v4;
   uint16_t mp_port_v6;
-  ur_addr_map mp_table; /* peer_addr:port -> ts_ur_super_session*; O(1) get/put/del */
+  mp_peer_table mp_table; /* peer_addr:port -> ts_ur_super_session*, capped per session */
 };
 
 #define SOCKET_MAGIC (0xABACADEF)
@@ -245,6 +246,13 @@ struct _ioa_socket {
    * set-sites. Defaults to false via the calloc() zero-init every ioa_socket
    * gets; only the shared sockets flip it true. */
   bool udp_recvmmsg_eligible;
+  /* DTLS half-open accounting: true from the moment this DTLS child socket is
+   * created (handshake not yet finished) until the handshake completes or the
+   * socket is closed. While true the socket holds one slot in the global
+   * turn_dtls_half_open counter; the flag makes the decrement idempotent and
+   * lets close_ioa_socket() release a slot for a handshake that never
+   * completed. Zero-initialized by the calloc() every ioa_socket gets. */
+  bool dtls_half_open;
   int done;
   ts_ur_super_session *session;
   int current_df_relay_flag;
@@ -293,13 +301,26 @@ int get_realm_data(char *name, realm_params_t *rp);
 
 /* multiplex-peer */
 
-int init_multiplex_peer(ioa_engine_handle e, int thread_id, uint16_t base_port);
+int init_multiplex_peer(ioa_engine_handle e, int thread_id, uint16_t base_port, size_t max_peers_per_session);
+/* Returns MP_REGISTER_OK, MP_REGISTER_CONFLICT or MP_REGISTER_LIMIT. */
 int mp_register_peer(ioa_engine_handle e, const ioa_addr *peer_addr, void *turn_session);
 void mp_deregister_peer(ioa_engine_handle e, const ioa_addr *peer_addr, void *turn_session);
 void mp_deregister_permission_peers(ioa_engine_handle e, const ioa_addr *peer_addr, void *turn_session);
 void mp_deregister_session_peers(ioa_engine_handle e, void *turn_session, int address_family);
 ioa_socket_handle mp_get_socket(ioa_engine_handle e, int af);
 uint16_t mp_get_port(ioa_engine_handle e, int af);
+
+/* DTLS half-open handshake cap (state-exhaustion mitigation, GHSA-5x2p-4vqj-f6m4).
+ * A DTLS ClientHello from a new source creates a per-peer SSL + socket + session
+ * before the source has proven return-routable via the DTLS cookie, so a flood
+ * of unanswered ClientHellos accumulates state. These bound the number of
+ * concurrent half-open (handshake-incomplete) DTLS sockets across all relay
+ * threads. turn_dtls_half_open_try_inc() reserves a slot if the live count is
+ * below cap (false = cap reached, caller must drop); turn_dtls_half_open_dec()
+ * releases one; the count is exposed for logging/tests. */
+bool turn_dtls_half_open_try_inc(uint32_t cap);
+void turn_dtls_half_open_dec(void);
+uint32_t turn_dtls_half_open_count(void);
 
 /* engine handling */
 

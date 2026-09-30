@@ -18,6 +18,8 @@ endfunction()
 
 coturn_add_test(test_ioaddr)
 coturn_add_test(test_stun_msg)
+coturn_add_test(test_saslprep)
+coturn_add_test(test_stateless_nonce)
 coturn_add_test(test_base64)
 coturn_add_test(test_http_server ../src/apps/relay/http_buffer.c)
 coturn_add_test(test_acme ../src/apps/relay/acme.c)
@@ -25,6 +27,34 @@ coturn_add_test(test_redis_conninfo ../src/apps/relay/dbdrivers/dbd_redis_connin
 coturn_add_test(test_log_min_level)
 coturn_add_test(test_ratelimit ../src/server/ns_turn_ratelimit.c)
 target_include_directories(test_ratelimit PRIVATE ../src/server ../src)
+
+# convert_string_key_to_binary() lives in dbdriver.c, which is not linkable on
+# its own (get_dbdriver() reaches turn_params and the driver getters), so the
+# real source is compiled in with a link-seam stub. TURN_NO_* keeps get_dbdriver
+# down to the always-present redis case, which the stub satisfies.
+add_executable(test_convert_key
+    test_convert_key.c
+    test_convert_key_stub.c
+    ../src/apps/relay/dbdrivers/dbdriver.c)
+target_include_directories(test_convert_key PRIVATE
+    ../src/apps/relay
+    ../src/server
+    ../src/apps/common
+    ../src
+    ../src/client)
+target_compile_definitions(test_convert_key PRIVATE
+    TURN_NO_MONGO TURN_NO_MYSQL TURN_NO_PQ TURN_NO_SQLITE TURN_NO_PROMETHEUS
+    TURN_NO_SCTP TURN_NO_SYSTEMD TURN_NO_THREAD_BARRIERS TURN_NO_HIREDIS
+    _FILE_OFFSET_BITS=64)
+target_link_libraries(test_convert_key PRIVATE turnclient unity)
+add_test(NAME test_convert_key COMMAND test_convert_key)
+list(APPEND COTURN_TEST_TARGETS test_convert_key)
+
+# Multiplex-peer demux table: per-session registration cap and per-session
+# deregistration. The module is self-contained, so it is compiled together
+# with the map implementation it uses.
+coturn_add_test(test_mp_peer_table ../src/apps/relay/mp_peer_table.c ../src/server/ns_turn_maps.c)
+target_include_directories(test_mp_peer_table PRIVATE ../src/server ../src)
 
 # Alternate-server list regression test (#1988). The test compiles the real
 # src/apps/relay/netengine.c into its own translation unit (to reach the static
@@ -48,6 +78,31 @@ target_compile_definitions(test_alt_server_list PRIVATE
 # The #1988 bug left the list mutex locked; if it regresses, the follow-up
 # add_alt_server blocks forever, so fail by timeout instead of hanging ctest.
 set_tests_properties(test_alt_server_list PROPERTIES TIMEOUT 60)
+
+# TURN server core (src/server/ns_turn_server.c). The core is written against
+# the abstract ioa_* interface that src/apps/relay implements, so the test
+# substitutes its own implementation of that interface and runs the server
+# in-process with no socket, timer or database. ns_turn_server.c is compiled
+# into the test translation unit to reach the static per-method handlers; the
+# sibling server sources it needs are listed explicitly rather than linked from
+# libturn_server, which would define ns_turn_server.c twice.
+coturn_add_test(test_turn_server_send
+    test_turn_server_stubs.c
+    ../src/server/ns_turn_allocation.c
+    ../src/server/ns_turn_maps.c
+    ../src/server/ns_turn_maps_rtcp.c
+    ../src/server/ns_turn_ratelimit.c)
+target_include_directories(test_turn_server_send PRIVATE
+    ../src/server
+    ../src/apps/common
+    ../src
+    ../src/client
+    ${OPENSSL_INCLUDE_DIR}
+    ${LIBEVENT_INCLUDE_DIRS})
+target_compile_definitions(test_turn_server_send PRIVATE
+    TURN_NO_MONGO TURN_NO_MYSQL TURN_NO_PQ TURN_NO_PROMETHEUS
+    TURN_NO_SCTP TURN_NO_SYSTEMD TURN_NO_THREAD_BARRIERS TURN_NO_HIREDIS
+    _FILE_OFFSET_BITS=64)
 
 # Relay port-allocator counter-wrap regression test (#1649). The allocator's
 # uint32_t low/high cursors wrap after ~4G alloc/release operations on a pool;
@@ -194,8 +249,28 @@ if(HIREDIS_FOUND AND LIBEVENT_FOUND)
     target_link_libraries(test_redis_format PRIVATE turnclient unity ${LIBEVENT_LIBRARIES})
     add_test(NAME test_redis_format COMMAND test_redis_format)
     list(APPEND COTURN_TEST_TARGETS test_redis_format)
+
+    # Uses real hiredis/libevent cleanup and wraps event_new() only to inject
+    # deterministic read/write event allocation failures.
+    add_executable(test_redis_libevent_cleanup test_redis_libevent_cleanup.c)
+    target_include_directories(test_redis_libevent_cleanup PRIVATE
+        ../src/apps/relay
+        ../src/server
+        ../src/apps/common
+        ../src
+        ../src/client
+        ${HIREDIS_INCLUDE_DIRS}
+        ${OPENSSL_INCLUDE_DIR}
+        ${LIBEVENT_INCLUDE_DIRS})
+    target_link_directories(test_redis_libevent_cleanup PRIVATE
+        ${HIREDIS_LIBRARY_DIRS}
+        ${LIBEVENT_LIBRARY_DIRS})
+    target_link_libraries(test_redis_libevent_cleanup PRIVATE
+        turnclient unity ${HIREDIS_LIBRARIES} ${LIBEVENT_LIBRARIES})
+    add_test(NAME test_redis_libevent_cleanup COMMAND test_redis_libevent_cleanup)
+    list(APPEND COTURN_TEST_TARGETS test_redis_libevent_cleanup)
 else()
-    message(STATUS "hiredis/libevent headers not found; skipping test_redis_format")
+    message(STATUS "hiredis/libevent not found; skipping Redis tests")
 endif()
 
 # Vendored Prometheus client (src/prometheus). Fully self-contained: only the

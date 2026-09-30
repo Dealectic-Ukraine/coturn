@@ -21,6 +21,17 @@ if [ ! -f $BINDIR/turnserver ]; then
     BINDIR="../build/bin"
 fi
 
+# Bound the client where a timeout tool exists. A stock macOS runner has
+# neither `timeout` nor `gtimeout` and never hits the Linux/TSan loadgen
+# livelock this guards; its job timeout-minutes is the backstop.
+if command -v timeout >/dev/null 2>&1; then
+    RUN_BOUNDED="timeout 120s"
+elif command -v gtimeout >/dev/null 2>&1; then
+    RUN_BOUNDED="gtimeout 120s"
+else
+    RUN_BOUNDED=""
+fi
+
 IS_DARWIN=0
 if [ "$(uname -s)" = "Darwin" ]; then
     IS_DARWIN=1
@@ -43,17 +54,16 @@ if [ "$(uname -s)" = "Linux" ]; then
 fi
 
 echo 'Running turnserver'
-if [ $IS_DARWIN -eq 1 ]; then
-    $BINDIR/turnserver --use-auth-secret --sock-buf-size=1048576 --static-auth-secret=secret --realm=north.gov --allow-loopback-peers --cert ../examples/ca/turn_server_cert.pem --pkey ../examples/ca/turn_server_pkey.pem > /dev/null &
-else
-    # --log-file=stdout forces turnserver's per-line log into our redirected
-    # stdout so $TURNSERVER_LOG actually gets populated. Without it,
-    # turnserver writes to its platform-default location (syslog or
-    # /var/log/turn_*.log) and our redirect captures an empty file; that
-    # breaks wait_for_turnserver, which polls the log for a known
-    # late-startup line, and it leaves the FAIL-path diagnostics useless.
-    $BINDIR/turnserver --use-auth-secret --sock-buf-size=1048576 --static-auth-secret=secret --realm=north.gov --allow-loopback-peers --log-file=stdout --simple-log $TURNSERVER_EXTRA_ARGS --cert ../examples/ca/turn_server_cert.pem --pkey ../examples/ca/turn_server_pkey.pem > "$TURNSERVER_LOG" 2>&1 &
-fi
+# --log-file=stdout forces turnserver's per-line log into our redirected
+# stdout so $TURNSERVER_LOG actually gets populated. Without it,
+# turnserver writes to its platform-default location (syslog or
+# /var/log/turn_*.log) and our redirect captures an empty file; that
+# breaks wait_for_turnserver, which polls the log for a known
+# late-startup line, and it leaves the FAIL-path diagnostics useless.
+# Both platforms capture the log: macOS used to launch with >/dev/null and
+# a fixed sleep, which raced uclient against a still-initializing server on
+# hosts with many local addresses (relay init runs per address).
+$BINDIR/turnserver --use-auth-secret --sock-buf-size=1048576 --static-auth-secret=secret --realm=north.gov --allow-loopback-peers --log-file=stdout --dtls $TURNSERVER_EXTRA_ARGS --cert ../examples/ca/turn_server_cert.pem --pkey ../examples/ca/turn_server_pkey.pem > "$TURNSERVER_LOG" 2>&1 &
 turnserver_pid="$!"
 
 echo 'Running peer client'
@@ -104,15 +114,11 @@ wait_for_turnserver() {
     tail -30 "$TURNSERVER_LOG" 2>/dev/null || echo "(log file missing)"
     return 1
 }
-if [ $IS_DARWIN -eq 1 ]; then
-    sleep 2
-else
-    wait_for_turnserver || exit 1
-    # No-barrier builds can log readiness before all worker event loops have
-    # had a scheduling turn. Keep the old startup cushion after the active
-    # per-process readiness check.
-    sleep 2
-fi
+wait_for_turnserver || exit 1
+# No-barrier builds can log readiness before all worker event loops have
+# had a scheduling turn. Keep the old startup cushion after the active
+# per-process readiness check.
+sleep 2
 
 # Dump the bits a maintainer needs to see when a protocol test fails: the
 # uclient progress lines (shows where send/recv counters stalled), any
@@ -162,8 +168,14 @@ run_uclient() {
     local label="$1"
     shift
     echo "Running $label"
-    "$BINDIR/turnutils_uclient" "$@" -e 127.0.0.1 -X -g -u user -W secret 127.0.0.1 > "$UCLIENT_LOG" 2>&1
-    if grep -q "start_mclient: tot_send_bytes ~ 1000, tot_recv_bytes ~ 1000" "$UCLIENT_LOG"; then
+    # Bound the run so a ThreadSanitizer-exposed loadgen livelock can't hang CI;
+    # success is decided by the grep below, so a post-completion timeout kill
+    # still passes, while a genuine failure still shows no marker.
+    $RUN_BOUNDED "$BINDIR/turnutils_uclient" "$@" -e 127.0.0.1 -X -g -u user -W secret 127.0.0.1 > "$UCLIENT_LOG" 2>&1
+    # Match the periodic progress line too, not only the final-summary line: a
+    # client the timeout had to kill never prints the summary, but a periodic
+    # line already carries the full byte counts once the round trip has completed.
+    if grep -q "tot_send_bytes ~ 1000, tot_recv_bytes ~ 1000" "$UCLIENT_LOG"; then
         echo OK
     else
         echo FAIL

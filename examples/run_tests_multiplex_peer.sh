@@ -55,8 +55,6 @@ run_client() {
   local expected_bytes="$3"
   local output
   local rc=0
-  local attempt
-  local max_attempts=8
   shift 3
 
   echo "Running $name"
@@ -64,27 +62,15 @@ run_client() {
   peer_pid="$!"
   sleep 1
 
-  for attempt in $(seq 1 "$max_attempts"); do
-    rc=0
-    output=$("$BINDIR/turnutils_uclient" "$@" 2>&1) || rc=$?
-    if printf '%s\n' "$output" |
-      grep -q "start_mclient: tot_send_bytes ~ $expected_bytes, tot_recv_bytes ~ $expected_bytes"; then
-      kill "$peer_pid" 2>/dev/null || true
-      wait "$peer_pid" 2>/dev/null || true
-      peer_pid=""
-      echo OK
-      return 0
-    fi
-
-    if printf '%s\n' "$output" | grep -q "error 400" &&
-      grep -q "EVEN-PORT is not supported with multiplex-peer" "$turnserver_log" &&
-      [ "$attempt" -lt "$max_attempts" ]; then
-      echo "Retrying $name after randomized EVEN-PORT request"
-      continue
-    fi
-
-    break
-  done
+  output=$("$BINDIR/turnutils_uclient" "$@" 2>&1) || rc=$?
+  if printf '%s\n' "$output" |
+    grep -q "start_mclient: tot_send_bytes ~ $expected_bytes, tot_recv_bytes ~ $expected_bytes"; then
+    kill "$peer_pid" 2>/dev/null || true
+    wait "$peer_pid" 2>/dev/null || true
+    peer_pid=""
+    echo OK
+    return 0
+  fi
 
   kill "$peer_pid" 2>/dev/null || true
   wait "$peer_pid" 2>/dev/null || true
@@ -99,30 +85,100 @@ run_client() {
   return 1
 }
 
+start_turnserver() {
+  : > "$turnserver_log"
+  "$BINDIR/turnserver" \
+    --use-auth-secret \
+    --sock-buf-size=1048576 \
+    --static-auth-secret=secret \
+    --realm=north.gov \
+    -L 127.0.0.1 \
+    -E 127.0.0.1 \
+    --allow-loopback-peers \
+    "${TURNSERVER_EXTRA_ARGS[@]}" \
+    "$@" \
+    -v \
+    --dtls \
+    --cert ca/turn_server_cert.pem \
+    --pkey ca/turn_server_pkey.pem \
+    --simple-log \
+    --log-file "$turnserver_log" \
+    > /dev/null &
+  turnserver_pid="$!"
+  sleep 5
+}
+
+stop_turnserver() {
+  if [ -n "$turnserver_pid" ]; then
+    kill "$turnserver_pid" 2>/dev/null || true
+    wait "$turnserver_pid" 2>/dev/null || true
+    turnserver_pid=""
+  fi
+}
+
+# The client permits the RTCP peer port too, so one peer is already two
+# endpoints and a cap of 1 is always exceeded; --no-even-port keeps the other
+# 508 on this path (EVEN-PORT) out of the picture.
+expect_peer_endpoint_limit() {
+  local peer_port="$1"
+  local output
+  local rc=0
+
+  echo "Running turn client UDP with two peer endpoints against --multiplex-peer-max-peers=1"
+  "$BINDIR/turnutils_peer" -p "$peer_port" -L 127.0.0.1 > /dev/null &
+  peer_pid="$!"
+  sleep 1
+
+  output=$(timeout 60 "$BINDIR/turnutils_uclient" --no-even-port -e 127.0.0.1 -r "$peer_port" \
+    -X -g -u user -W secret 127.0.0.1 2>&1) || rc=$?
+
+  kill "$peer_pid" 2>/dev/null || true
+  wait "$peer_pid" 2>/dev/null || true
+  peer_pid=""
+
+  if printf '%s\n' "$output" | grep -q "error 508" &&
+    grep -q "peer-endpoint limit" "$turnserver_log"; then
+    echo "OK (second peer endpoint refused with 508)"
+    return 0
+  fi
+
+  echo FAIL
+  printf '%s\n' "$output"
+  print_turnserver_log_tail
+  if [ "$rc" -ne 0 ]; then
+    return "$rc"
+  fi
+  return 1
+}
+
 echo "Running turnserver in multiplex-peer mode on base port $MULTIPLEX_PEER_PORT"
-"$BINDIR/turnserver" \
-  --use-auth-secret \
-  --sock-buf-size=1048576 \
-  --static-auth-secret=secret \
-  --realm=north.gov \
-  -L 127.0.0.1 \
-  -E 127.0.0.1 \
-  --allow-loopback-peers \
-  "${TURNSERVER_EXTRA_ARGS[@]}" \
-  -v \
-  --cert ca/turn_server_cert.pem \
-  --pkey ca/turn_server_pkey.pem \
-  --simple-log \
-  --log-file "$turnserver_log" \
-  > /dev/null &
-turnserver_pid="$!"
+start_turnserver
 
-sleep 5
+# Multiplex-peer rejects EVEN-PORT with 508, and -c alone leaves the client
+# picking EVEN-PORT at random, so --no-even-port is what makes these runs
+# deterministic.
+run_client "turn client UDP" 3480 500 -c --no-even-port -e 127.0.0.1 -r 3480 -X -g -u user -W secret 127.0.0.1
+run_client "turn client TCP" 3482 500 -c --no-even-port -t -e 127.0.0.1 -r 3482 -X -g -u user -W secret 127.0.0.1
+run_client "turn client TLS" 3484 500 -c --no-even-port -t -S -e 127.0.0.1 -r 3484 -X -g -u user -W secret 127.0.0.1
+run_client "turn client DTLS" 3490 500 -c --no-even-port -S -e 127.0.0.1 -r 3490 -X -g -u user -W secret 127.0.0.1
 
-# Multiplex-peer is incompatible with EVEN-PORT, so these tests disable RTCP reservation with -c.
-run_client "turn client UDP" 3480 500 -c -e 127.0.0.1 -r 3480 -X -g -u user -W secret 127.0.0.1
-run_client "turn client TCP" 3482 500 -c -t -e 127.0.0.1 -r 3482 -X -g -u user -W secret 127.0.0.1
-run_client "turn client TLS" 3484 500 -c -t -S -e 127.0.0.1 -r 3484 -X -g -u user -W secret 127.0.0.1
-run_client "turn client DTLS" 3490 500 -c -S -e 127.0.0.1 -r 3490 -X -g -u user -W secret 127.0.0.1
+sleep 2
+
+stop_turnserver
+echo "Restarting turnserver with --multiplex-peer-max-peers=4"
+start_turnserver --multiplex-peer-max-peers=4
+run_client "turn client UDP (peer-endpoint cap 4)" 3492 500 -c --no-even-port -e 127.0.0.1 -r 3492 -X -g -u user \
+  -W secret 127.0.0.1
+
+stop_turnserver
+echo "Restarting turnserver with --multiplex-peer-max-peers=1"
+start_turnserver --multiplex-peer-max-peers=1
+# The shared relay socket, and with it the demux table the cap applies to,
+# only exists where multiplex-peer is supported.
+if grep -q "multiplex-peer: thread 0" "$turnserver_log"; then
+  expect_peer_endpoint_limit 3494
+else
+  echo "SKIP: multiplex-peer is not active on this platform; peer-endpoint cap not exercised"
+fi
 
 sleep 2

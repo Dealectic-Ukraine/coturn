@@ -83,10 +83,10 @@ run_ratelimit_server() {
     fi
     : > "$RATELIMIT_LOG"
     "$BINDIR/turnserver" --use-auth-secret --static-auth-secret=secret --realm=north.gov \
-        --allow-loopback-peers --no-cli --no-tls --no-dtls \
+        --allow-loopback-peers --no-tls \
         --listening-ip=127.0.0.1 --relay-ip=127.0.0.1 \
         --listening-port=3479 \
-        --log-file=stdout --simple-log \
+        --log-file=stdout \
         "$@" > "$RATELIMIT_LOG" 2>&1 &
     turnserver_pid="$!"
     wait_for_turnserver
@@ -126,4 +126,42 @@ if grep -q '401 rate-limit exceeded from' "$RATELIMIT_LOG"; then
     exit 1
 else
     echo OK
+fi
+
+# The stateless-nonce listener answers a forged MESSAGE-INTEGRITY with a 438
+# without building a session. That reply still goes to an unverified source, so
+# it draws on the same per-source budget as the 401.
+FLOOD=50
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "SKIP: python3 not available (forged-MESSAGE-INTEGRITY reflection cap)"
+    exit 0
+fi
+
+echo "Running unauthenticated-reply rate-limit (forged MESSAGE-INTEGRITY, positive)"
+run_ratelimit_server --stateless-nonce-secret=fleet-nonce-secret \
+    --unauthorized-ratelimit --unauthorized-ratelimit-rps=1 || exit 1
+replied="$(python3 scripts/stateless_nonce_forged_mi.py 127.0.0.1 3479 user flood "$FLOOD" \
+           | sed -n 's/.*replied=\([0-9]*\).*/\1/p')"
+if [ -n "$replied" ] && [ "$replied" -lt "$FLOOD" ] \
+   && grep -q 'unauthorized-response rate-limit exceeded from' "$RATELIMIT_LOG"; then
+    echo "OK ($replied/$FLOOD 438s answered, rest suppressed)"
+else
+    echo "FAIL: forged-MI 438s not capped (replied=$replied of $FLOOD)"
+    echo "--- turnserver log (last 40 lines) ---"
+    tail -40 "$RATELIMIT_LOG"
+    exit 1
+fi
+
+echo "Running unauthenticated-reply rate-limit (forged MESSAGE-INTEGRITY, negative: high threshold)"
+run_ratelimit_server --stateless-nonce-secret=fleet-nonce-secret \
+    --unauthorized-ratelimit --unauthorized-ratelimit-rps=100000 || exit 1
+replied="$(python3 scripts/stateless_nonce_forged_mi.py 127.0.0.1 3479 user flood "$FLOOD" \
+           | sed -n 's/.*replied=\([0-9]*\).*/\1/p')"
+if [ "$replied" = "$FLOOD" ] && ! grep -q 'unauthorized-response rate-limit exceeded from' "$RATELIMIT_LOG"; then
+    echo OK
+else
+    echo "FAIL: 438s suppressed below threshold (replied=$replied of $FLOOD)"
+    echo "--- turnserver log (last 40 lines) ---"
+    tail -40 "$RATELIMIT_LOG"
+    exit 1
 fi
